@@ -1,0 +1,32 @@
+;------------------------------------------------------------------------------
+; Depth of field by choosing a range of z values and using that to select
+; a blurred version of the original image.
+; 
+; Copyright (C) 2001 Microsoft Corporation
+; All rights reserved.
+;------------------------------------------------------------------------------
+xps.1.1
+
+; override with SetPixelShaderConstant
+def c0, 0.f, 0.f, 0.f, 0.f      ; offset
+def c1, 0.f, 0.f, 1.f, 0.f      ; slope x1
+def c2, 0.f, 0.f, 0.f, 0.f      ; slope x4
+def c3, 0.f, 0.f, 0.f, 1.f      ; slope x16
+def c4, 1.f, 1.f, 1.f, 0.498039215      ; 0x7f
+
+; source textures
+tex t0                  ; z-buffer texture
+tex t1                  ; pre-blurred texture
+
+; get the range of active z values
+sub    r0, t0, c0               ; offset
+mul_x4 r1, c3, r0               ; scale x16
+mad_x4 r1, c2, r0, r1           ; scale x4
+mad    r1, c1, r0, r1           ; scale x1
+sub r0.a, r1.a, c4.a            ; subtract 0x7f from r1.a
+cnd r0.a, r0.a, zero.a, r1.b    ; keep blue only if r1.a is not 0xff
+add r1.a, r1.a, r0.a            ; add alpha + blue, the desired range is now mapped to [0,1]
+mul r1.a, r1_bx2.a, r1_bx2.a    ; convert to -1,1 range and square to get parabola
+
+; modulate pre-blurred texture by depth range
+xfc r1.a, t1, zero, zero, zero, zero, r1.a

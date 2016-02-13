@@ -1,0 +1,11 @@
+; Shadow buffer pixel shader.
+; On entry:
+; c0 contains the base percentage of color (even in shadow),
+; c1 contains the percentage of color that shadow affects.
+
+xps.1.1
+
+tex t3			; get shadow from light
+
+mul r1, c1, t3	; Use the shadow buffer to affect the shadow portion of the color change
+add r0, c0, r1	; Add to the base color to get final color

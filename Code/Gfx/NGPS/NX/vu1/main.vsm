@@ -1,0 +1,156 @@
+
+;	имммммммммммм╩
+;	╨ tag format ╨
+;	хмммммммммммм╪
+;
+;	This follows GIFtag format (EE User's Manual section 7.2.2), but with some added fields.
+;
+;
+;
+;	 31 30                   23 22                16 15 14                                         0
+;	зддбдддддддддддддддддддддддбддддддддддддддддддддбддбдддддддддддддддддддддддддддддддддддддддддддд©
+;	Ё0 Ё     STEP exponent     Ё STEP mantissa      ЁEOP                   NLOOP                    Ё
+;	юддадддддддддддддддддддддддаддддддддддддддддддддаддадддддддддддддддддддддддддддддддддддддддддддды
+;
+;
+;	 63       60 59 58 57                            47 46 45    43 42                            32
+;	здддддддддддбдддддбддддддддддддддддддддддддддддддддбддбддддддддбдддддддддддддддддддддддддддддддд©
+;	Ё   NREG    Ё FLG Ё              PRIM              ЁPRE        Ё              ADDR              Ё
+;	юдддддддддддадддддаддддддддддддддддддддддддддддддддаддаддддддддадддддддддддддддддддддддддддддддды
+;
+;
+;	 95                                                       76 75       72 71       68 67       64
+;	здддддддддддддддддддддддддддддддддддддддддддддддддддддддддддбдддддддддддбдддддддддддбддддддддддд©
+;	Ё                                                     ...   Ё  [REG2]   Ё  [REG1]   Ё   REG0    Ё
+;	юдддддддддддддддддддддддддддддддддддддддддддддддддддддддддддадддддддддддадддддддддддаддддддддддды
+;
+;
+;	 127                                         112 111                                          96
+;	здддддддддддддддддддддддддддддддддддддддддддддддбддддддддддддддддддддддддддддддддддддддддддддддд©
+;	Ё                                               Ё                      SIZE                     Ё
+;	юдддддддддддддддддддддддддддддддддддддддддддддддаддддддддддддддддддддддддддддддддддддддддддддддды
+;
+;
+;
+
+
+Init:	NOP[E]							IADDIU		VI02,VI00,0			; initialise VI02
+		NOP								NOP
+
+ProcessPacket:
+		NOP								LQI			VF01,(VI02++)		; get 1st tag
+		NOP								ISUBIU		VI13,VI02,1			; VI13 = start address of current packet
+		NOP								IADDIU		VI15,VI00,0			; set EOP=0
+		NOP								XITOP		VI14				; get run-time render flags from VIF1_ITOP
+
+MainLoop:
+		NOP								IBLTZ		VI15,KickPacket		; kick if EOP==1
+		ADDw		VF02,VF01,VF00w		MTIR		VI01,VF01y			; VI01 = ADDR, jumptable address. 'ADDw' is for extracting STEP
+		NOP								MTIR		VI15,VF01x			; VI15 = EOP:NLOOP
+		NOP								MTIR		VI06,VF01w			; VI06 = SIZE = NREG*NLOOP, size of prim (excl. tag)
+		NOP								IADD		VI05,VI02,VI06		; VI05 = end pointer for prim
+		NOP								JR			VI01				; jump via jumptable
+		NOP								MTIR		VI04,VF02x			; VI04 = STEP (branch delay slot)
+
+
+KickPacket:
+		; kick and stop
+		NOP[E]							XGKICK		VI13				; kick the processed packet to the GS
+		NOP								ISUBIU		VI02,VI02,1			; undo last postincrement (so VI02 points to next packet)
+
+
+NextPrim:
+		NOP								LQI			VF01,(VI02++)		; get next tag
+		NOP								B			MainLoop			; loop
+		NOP								NOP
+
+
+
+
+; SIZE field must be NREG*NLOOP - 1
+; STEP mantissa must generate the value n*3-27 where VFn is the first reg in the context
+
+
+VU1Context:
+
+		NOP								IADDIU		VI01,VI04,VU1Context; eventually optimise this away and just do...
+		NOP								JR			VI01				; JR VI04
+		SUBA.w		ACC,VF00,VF00		LOI			0x44800000			; 2^10
+
+
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF10,(VI02++)
+		NOP								LOI			0x45000000			; 2^11
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF11,(VI02++)
+		NOP								LOI			0x45800000			; 2^12
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF12,(VI02++)
+		NOP								LOI			0x46000000			; 2^13
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF13,(VI02++)
+		NOP								LOI			0x46800000			; 2^14
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF14,(VI02++)
+		NOP								LOI			0x47000000			; 2^15
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF15,(VI02++)
+		NOP								LOI			0x47800000			; 2^16
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF16,(VI02++)
+		NOP								LOI			0x48000000			; 2^17
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF17,(VI02++)
+		NOP								LOI			0x48800000			; 2^18
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF18,(VI02++)
+		NOP								LOI			0x49000000			; 2^19
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF19,(VI02++)
+		NOP								LOI			0x49800000			; 2^20
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF20,(VI02++)
+		NOP								LOI			0x4A000000			; 2^21
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF21,(VI02++)
+		NOP								LOI			0x4A800000			; 2^22
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF22,(VI02++)
+		NOP								LOI			0x4B000000			; 2^23
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF23,(VI02++)
+		NOP								LOI			0x4B800000			; 2^24
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF24,(VI02++)
+		NOP								LOI			0x4C000000			; 2^25
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF25,(VI02++)
+		NOP								LOI			0x4C800000			; 2^26
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF26,(VI02++)
+		NOP								LOI			0x4D000000			; 2^27
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF27,(VI02++)
+		NOP								LOI			0x4D800000			; 2^28
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF28,(VI02++)
+		NOP								LOI			0x4E000000			; 2^29
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF29,(VI02++)
+		NOP								LOI			0x4E800000			; 2^30
+		NOP								IBEQ		VI02,VI05,NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF30,(VI02++)
+		NOP								LOI			0x4F000000			; 2^31
+		NOP								B			NextPrim
+		MADDAi.w	ACC,VF00,I			LQI			VF31,(VI02++)
+		
+
+
+
+
+
+GSContext:
+		NOP								LQ			VF01,0(VI05)
+		NOP								B			MainLoop
+		NOP								IADDIU		VI02,VI05,1
+

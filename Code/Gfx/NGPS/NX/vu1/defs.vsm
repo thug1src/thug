@@ -1,0 +1,5 @@
+
+		.equr	zero,	VF00x
+		.equr	one,	VF00w
+
+

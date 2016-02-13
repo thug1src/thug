@@ -1,0 +1,276 @@
+
+
+;------------------------------------------------------------------------------------------------------------------------------------
+; post-process fog effect
+; (this will be replaced by a vu1 routine)
+
+.global FogDma
+.global FogPalette
+
+.align 7	; align to multiple of 8 qwords (2^7 bytes) to give fastest dma transfer
+FogDma:
+
+
+		; preswizzled 256-colour palette, 32-bit entries
+
+
+DMAcnt	*
+
+	DIRECT *
+	
+		; set registers for palette transfer to vram
+		.quad	0x00000000_0000000E_10000000_00000004		; GifTag	(GS_A_D,1,PACKED,0,0,0,4)
+		.quad	0x00000000_00000050_00013000_00000000		; BITBLTBUF	(0,0,0,0x3000,1,PSMCT32)
+		.quad	0x00000000_00000051_00000000_00000000		; TRXPOS	(0,0,0,0,0)
+		.quad	0x00000000_00000052_00000010_00000010		; TRXREG	(16,16)
+		.quad   0x00000000_00000053_00000000_00000000		; TRXDIR	(0)
+		
+		; image mode giftag for palette
+		.quad	0x00000000_00000000_08000000_00000040		; GifTag	(0,0,IMAGE,0,0,0,64)
+
+FogPalette:
+
+		; the palette itself (which is filled in at run-time)
+		.rept	256
+		.int	0
+		.endr
+
+
+
+		.quad	0x00000000_0000000E_10AB4000_00008008		; GifTag	(GS_A_D,1,PACKED,SPRITE|TME|ABE|FST,1,1,8)
+		.quad	0x00000000_0000003F_00000000_00000000		; TEXFLUSH	(0)
+		.quad	0x00000000_00000014_00000000_00000001		; TEX1_1	(1,0,NEAREST,NEAREST,0,0,0)
+		.quad	0x00000000_00000008_00000000_00003F73		; CLAMP_1	(REGION_REPEAT,REPEAT,0x3F7,0,0,0)
+		.quad	0x00000000_00000040_01BF0000_027F0000		; SCISSOR_1	(0,447,0,639)
+		.quad	0x00000000_00000042_00000000_00000044		; ALPHA_1	(Cs,Cd,As,Cd,0)
+		.quad	0x00000000_00000047_00000000_00050000		; TEST_1	(ZGEQUAL,1,0,0,0,0,0,0)
+		.quad	0x00000000_0000004C_00000000_000A0000		; FRAME_1	(0,10,PSMCT32,0)
+		.quad	0x00000000_0000004E_00000001_010000D2		; ZBUF_1	(0xD2,PSMZ24,1)
+		
+	.EndDirect
+	
+.EndDmaData
+
+
+
+; break screen into halves, otherwise source texture > 1024 in width
+; left half
+DMAcall *,HalfScreen
+
+	DIRECT *
+	
+		; set up source and dest coordinate origins
+		.quad	0x00000000_0000000E_10AB4000_00008002		; GifTag	(GS_A_D,1,PACKED,SPRITE|TME|ABE|FST,1,1,1)
+		.quad	0x00000000_00000006_2006000E_A9351A40		; TEX0_1	(0x1A40,20,PSMT8,10,10,RGBA,DECAL,0x3000,PSMCT32,CSM1,0,1)
+		.quad	0x00000000_00000018_00000000_00001400		; XYOFFSET_1(0x1400,0)
+		
+	.EndDirect
+
+.EndDmaData
+
+
+
+; right half
+DMAcall *,HalfScreen
+
+	DIRECT *
+	
+		; set up source and dest coordinate origins
+		.quad	0x00000000_0000000E_10AB4000_00008002		; GifTag	(GS_A_D,1,PACKED,SPRITE|TME|ABE|FST,1,1,1)
+		.quad	0x00000000_00000006_2006000E_A9351AE0		; TEX0_1	(0x1AE0,20,PSMT8,10,10,RGBA,DECAL,0x3000,PSMCT32,CSM1,0,1)
+		.quad	0x00000000_00000018_00000000_00000000		; XYOFFSET_1(0,0)
+		
+	.EndDirect
+
+.EndDmaData
+
+
+
+; restore and return
+DMAret *
+
+	DIRECT *
+	
+		; restore any GS regs that we shouldn't have knackered
+		.quad	0x00000000_0000000E_10000000_00008001		; GifTag	(GS_A_D,1,PACKED,0,0,1,1)
+		.quad	0x00000000_00000008_00000000_00000000		; CLAMP_1	(REPEAT,REPEAT,0,0,0,0)
+
+	.EndDirect
+
+.EndDmaData
+
+
+
+; apply fogging effect to half of the screen (left or right)
+
+.align 7		; align to 8 qwords
+HalfScreen:
+
+; This innocent-looking piece of assembler generates 280K of dma data!
+; (It will eventually be replaced with a small VU1 progam that generates it on the fly, saving memory and dma bandwidth.)
+
+DMAret *
+
+	DIRECT *
+
+.if 0	 ; Change to 1 to get the full-screen fog back, and lose 280K of memory
+		.quad	0x00000000_00005353_44000000_0000A300		; GifTag	(UV|XYZ2<<4|UV<<8|XYZ2<<12,4,REGLIST,0,0,1,8960)
+
+		; loop over quarter-pages		
+		qpageX = 0
+		.rept 10
+
+			; use diagonally facing quarter-page as the source		
+			qpageU = (qpageX^0x200)*2+8
+		
+			qpageY = 0
+			.rept 28
+			
+				; use diagonally facing quarter-page as the source		
+				qpageV = (qpageY^0x100)*2+8
+				
+				X = qpageX+0x1400
+				U = qpageU
+				.rept 4
+				
+					Y = qpageY
+					V = qpageV+0x20
+					.rept 4
+					
+						; even column
+						.short U+0x40,V,0,0
+						.short X,Y,0xFFFF,0x0080
+						.short U+0xC0,V+0x20,0,0
+						.short X+0x80,Y+0x20,0xFFFF,0x0080
+						
+						; odd column
+						.short U,V+0x40,0,0
+						.short X,Y+0x20,0xFFFF,0x0080
+						.short U+0x80,V+0x60,0,0
+						.short X+0x80,Y+0x40,0xFFFF,0x0080
+						
+						Y = Y+0x40
+						V = V+0x80
+					.endr
+				
+					X = X+0x80
+					U = U+0x100
+				.endr
+		
+				qpageY = qpageY+0x100
+			.endr
+		
+			qpageX = qpageX+0x200
+		.endr
+.else
+; Mick:  Just bunged in something to make it not crash
+		.quad	0x00000000_0000000E_10000000_00008001		; GifTag	(GS_A_D,1,PACKED,0,0,1,1)
+		.quad	0x00000000_00000008_00000000_00000000		; CLAMP_1	(REPEAT,REPEAT,0,0,0,0)
+.endif
+	
+	.EndDirect
+
+.EndDmaData
+
+;------------------------------------------------------------------------------------------------------------------------------------
+
+.if 0
+
+; BILLBOARD TEST
+
+.global BillboardDma
+.global BillboardContext
+.global BillboardMats
+
+.align 4
+BillboardDma:
+DMAret *
+
+	UNPACK	1, 1, V4_32, 0, *
+	
+	; VU context... 32
+	.quad	0x0000000C_0000000F_10000020_3400000C
+BillboardContext:
+	.quad	0,0,0,0
+BillboardMats:
+	.quad	0,0,0,0									; world to camera matrix
+	.quad	0,0,0,0									; camera to screen matrix
+	
+	; axial billboards... 86
+	.quad	0x00000024_00000512_300E4056_35C0000C
+	
+	.float	0,0,1,0									; stq0
+	.int	90,45,15,128							; rgba0
+	.float	0,100,0,0								; xyz
+	.float	1,0,1,0									; stq1
+	.int	30,15,5,128								; rgba1
+	.float	10,100,0,0								; w/2,h/2
+	.float	0,1,1,0									; stq2
+	.int	90,45,15,128							; rgba2
+	.float	0,0,0,0									; tx,ty,tz
+	.float	1,1,1,0									; stq3
+	.int	30,15,5,128								; rgba3
+	.float	0,1,0,0									; axis
+	
+	.float	0,0,1,0									; stq0
+	.int	90,45,15,128							; rgba0
+	.float	70.71,270.71,0,0						; xyz
+	.float	1,0,1,0									; stq1
+	.int	30,15,5,128								; rgba1
+	.float	10,100,0,0								; w/2,h/2
+	.float	0,1,1,0									; stq2
+	.int	90,45,15,128							; rgba2
+	.float	0,0,0,0									; tx,ty,tz
+	.float	1,1,1,0									; stq3
+	.int	30,15,5,128								; rgba3
+	.float	0.7071,0.7071,0,0						; axis
+	
+	.float	0,0,1,0									; stq0
+	.int	90,45,15,128							; rgba0
+	.float	-70.71,270.71,0,0						; xyz
+	.float	1,0,1,0									; stq1
+	.int	30,15,5,128								; rgba1
+	.float	10,100,0,0								; w/2,h/2
+	.float	0,1,1,0									; stq2
+	.int	90,45,15,128							; rgba2
+	.float	0,0,0,0									; tx,ty,tz
+	.float	1,1,1,0									; stq3
+	.int	30,15,5,128								; rgba3
+	.float	-0.7071,0.7071,0,0						; axis
+	
+	; screen-aligned billboards... 84
+	.quad	0x00000018_00000512_302E4054_35C08008
+	
+	.float	0,0,1,0									; stq0
+	.int	0,100,0,64								; rgba0
+	.float	141.42,341.42,0,0						; xyz
+	.float	1,0,1,0									; stq1
+	.int	0,100,0,64								; rgba1
+	.float	60,60,0,0								; w/2,h/2
+	.float	0,1,1,0									; stq2
+	.int	0,100,0,64								; rgba2
+	.float	0,0,10,0								; tx,ty,tz
+	.float	1,1,1,0									; stq3
+	.int	0,100,0,64								; rgba3
+	.float	0,0,0,0									; axis
+	
+	.float	0,0,1,0									; stq0
+	.int	0,100,0,64								; rgba0
+	.float	-141.42,341.42,0,0						; xyz
+	.float	1,0,1,0									; stq1
+	.int	0,100,0,64								; rgba1
+	.float	60,60,0,0								; w/2,h/2
+	.float	0,1,1,0									; stq2
+	.int	0,100,0,64								; rgba2
+	.float	0,0,10,0								; tx,ty,tz
+	.float	1,1,1,0									; stq3
+	.int	0,100,0,64								; rgba3
+	.float	0,0,0,0									; axis
+	.EndUnpack
+
+.EndDmaData
+
+.endif
+
+;------------------------------------------------------------------------------------------------------------------------------------
+

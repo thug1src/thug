@@ -1,0 +1,16 @@
+AR	 = snarl.exe
+AS	 = ps2cc -iop
+CC	 = ps2cc -iop
+GCC	 = ps2cc -iop
+LD	 = ps2cc -iop
+NM	 = C:/usr/local/sce/iop/gcc/bin/iop-nm.exe
+SIZE	 = iop-size.exe
+STRIP	 = C:/usr/local/sce/iop/gcc/bin/iop-strip.exe
+RANLIB	 = C:/usr/local/sce/iop/gcc/bin/iop-ranlib.exe
+OBJCOPY	 = C:/usr/local/sce/iop/gcc/bin/iop-objcopy.exe
+OBJDUMP	 = C:/usr/local/sce/iop/gcc/bin/iop-objdump.exe
+IFIXUP	 = iopfixup.exe
+ILBGEN	 = C:/usr/local/sce/iop/gcc/bin/ioplibgen.exe
+ILBLD	 = C:/usr/local/sce/iop/gcc/mipsel-scei-elfl/bin/ioplibld.exe
+ILBDUMP	 = C:/usr/local/sce/iop/gcc/mipsel-scei-elfl/bin/ioplibdump.exe
+BIN2OBJ	 = bin2elf.exe

@@ -1,0 +1,613 @@
+
+.global MPGStart0
+.global MPGEnd0
+
+.global	TestFunc
+.global	InitialiseOccluders
+.global TestSphereAgainstOccluders
+.global RayTriangleCollision
+.global BatchRayTriangleCollision
+.global ViewCullTest
+.global OuterCullTest
+.global BothCullTests
+
+; align to a 2^4=16 byte boundary, so it can be the target of a dma::ref
+.align	4
+
+MPGStart0:
+
+MPG 0, *
+
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+
+TestFunc:
+
+		; just a little test func to make sure I understand how to communicate with a vu0 microprogram
+
+		; integer register test
+		NOP								IADD		VI02,VI01,VI01
+		
+		; float register test
+		ADDw		VF02,VF01,VF00w		NOP
+		
+		; memory test
+		NOP								LQ			VF03,0(VI00)
+		ADDw		VF03,VF03,VF00w		NOP
+		
+		; quit
+		NOP[E]							NOP
+		NOP								NOP
+
+
+
+InitialiseOccluders:
+
+		; this function will be optimised later... not a priority now since only called once per frame (per camera)
+
+		; assumes an initial state where the 5 planes of occluder 0 are at addresses 0,1,2,3,4
+		; occluder 1 at 5,6,7,8,9, etc, and the number of occluders is in VI01
+
+		
+		; get address of 1st spare occluder
+		NOP								IADD		VI05,VI01,VI01
+		NOP								IADD		VI05,VI05,VI05
+		NOP								IADD		VI05,VI05,VI01
+		
+		; set up a sentinel plane that's colossally far away
+		NOP								LOI			-1.0e+35
+		MULi		VF01,VF00,I			NOP
+		
+		; add 1 sentinel occluder (5 sentinel planes)
+		NOP								SQI			VF01,(VI05++)
+		NOP								SQI			VF01,(VI05++)
+		NOP								SQI			VF01,(VI05++)
+		NOP								SQI			VF01,(VI05++)
+		NOP								SQI			VF01,(VI05++)
+		
+		; rearrange memory
+		NOP								IADDIU		VI02,VI00,0
+		NOP								MFIR.xyzw	VF31,VI00
+		
+MemLoop:
+		; load 4 occluders, 5 planes each
+
+		NOP								LQ			VF01,0(VI02)
+		NOP								LQ			VF02,5(VI02)
+		NOP								LQ			VF03,10(VI02)
+		NOP								LQ			VF04,15(VI02)
+		NOP								LQ			VF05,1(VI02)
+		NOP								LQ			VF06,6(VI02)
+		NOP								LQ			VF07,11(VI02)
+		NOP								LQ			VF08,16(VI02)
+		NOP								LQ			VF09,2(VI02)
+		NOP								LQ			VF10,7(VI02)
+		NOP								LQ			VF11,12(VI02)
+		NOP								LQ			VF12,17(VI02)
+		NOP								LQ			VF13,3(VI02)
+		NOP								LQ			VF14,8(VI02)
+		NOP								LQ			VF15,13(VI02)
+		NOP								LQ			VF16,18(VI02)
+		NOP								LQ			VF17,4(VI02)
+		NOP								LQ			VF18,9(VI02)
+		NOP								LQ			VF19,14(VI02)
+		NOP								LQ			VF20,19(VI02)
+		
+		
+		; transpose VF01,VF02,VF03,VF04
+		
+		NOP								MOVE		VF21,VF01
+		NOP								MOVE		VF22,VF02
+		NOP								MOVE		VF23,VF03
+		
+		ADDx.y		VF01,VF31,VF02x		NOP
+		ADDx.z		VF01,VF31,VF03x		NOP
+		ADDx.w		VF01,VF31,VF04x		NOP
+		
+		ADDy.x		VF02,VF31,VF21y		NOP
+		ADDy.z		VF02,VF31,VF03y		NOP
+		ADDy.w		VF02,VF31,VF04y		NOP
+		
+		ADDz.x		VF03,VF31,VF21z		NOP
+		ADDz.y		VF03,VF31,VF22z		NOP
+		ADDz.w		VF03,VF31,VF04z		NOP
+		
+		ADDw.x		VF04,VF31,VF21w		NOP
+		ADDw.y		VF04,VF31,VF22w		NOP
+		ADDw.z		VF04,VF31,VF23w		NOP
+		
+		
+		; transpose VF05,VF06,VF07,VF08
+		
+		NOP								MOVE		VF21,VF05
+		NOP								MOVE		VF22,VF06
+		NOP								MOVE		VF23,VF07
+		
+		ADDx.y		VF05,VF31,VF06x		NOP
+		ADDx.z		VF05,VF31,VF07x		NOP
+		ADDx.w		VF05,VF31,VF08x		NOP
+		
+		ADDy.x		VF06,VF31,VF21y		NOP
+		ADDy.z		VF06,VF31,VF07y		NOP
+		ADDy.w		VF06,VF31,VF08y		NOP
+		
+		ADDz.x		VF07,VF31,VF21z		NOP
+		ADDz.y		VF07,VF31,VF22z		NOP
+		ADDz.w		VF07,VF31,VF08z		NOP
+		
+		ADDw.x		VF08,VF31,VF21w		NOP
+		ADDw.y		VF08,VF31,VF22w		NOP
+		ADDw.z		VF08,VF31,VF23w		NOP
+		
+		
+		; transpose VF09,VF10,VF11,VF12
+		
+		NOP								MOVE		VF21,VF09
+		NOP								MOVE		VF22,VF10
+		NOP								MOVE		VF23,VF11
+		
+		ADDx.y		VF09,VF31,VF10x		NOP
+		ADDx.z		VF09,VF31,VF11x		NOP
+		ADDx.w		VF09,VF31,VF12x		NOP
+		
+		ADDy.x		VF10,VF31,VF21y		NOP
+		ADDy.z		VF10,VF31,VF11y		NOP
+		ADDy.w		VF10,VF31,VF12y		NOP
+		
+		ADDz.x		VF11,VF31,VF21z		NOP
+		ADDz.y		VF11,VF31,VF22z		NOP
+		ADDz.w		VF11,VF31,VF12z		NOP
+		
+		ADDw.x		VF12,VF31,VF21w		NOP
+		ADDw.y		VF12,VF31,VF22w		NOP
+		ADDw.z		VF12,VF31,VF23w		NOP
+		
+		
+		; transpose VF13,VF14,VF15,VF16
+		
+		NOP								MOVE		VF21,VF13
+		NOP								MOVE		VF22,VF14
+		NOP								MOVE		VF23,VF15
+		
+		ADDx.y		VF13,VF31,VF14x		NOP
+		ADDx.z		VF13,VF31,VF15x		NOP
+		ADDx.w		VF13,VF31,VF16x		NOP
+		
+		ADDy.x		VF14,VF31,VF21y		NOP
+		ADDy.z		VF14,VF31,VF15y		NOP
+		ADDy.w		VF14,VF31,VF16y		NOP
+		
+		ADDz.x		VF15,VF31,VF21z		NOP
+		ADDz.y		VF15,VF31,VF22z		NOP
+		ADDz.w		VF15,VF31,VF16z		NOP
+		
+		ADDw.x		VF16,VF31,VF21w		NOP
+		ADDw.y		VF16,VF31,VF22w		NOP
+		ADDw.z		VF16,VF31,VF23w		NOP
+		
+		
+		; transpose VF17,VF18,VF19,VF20
+		
+		NOP								MOVE		VF21,VF17
+		NOP								MOVE		VF22,VF18
+		NOP								MOVE		VF23,VF19
+		
+		ADDx.y		VF17,VF31,VF18x		NOP
+		ADDx.z		VF17,VF31,VF19x		NOP
+		ADDx.w		VF17,VF31,VF20x		NOP
+		
+		ADDy.x		VF18,VF31,VF21y		NOP
+		ADDy.z		VF18,VF31,VF19y		NOP
+		ADDy.w		VF18,VF31,VF20y		NOP
+		
+		ADDz.x		VF19,VF31,VF21z		NOP
+		ADDz.y		VF19,VF31,VF22z		NOP
+		ADDz.w		VF19,VF31,VF20z		NOP
+		
+		ADDw.x		VF20,VF31,VF21w		NOP
+		ADDw.y		VF20,VF31,VF22w		NOP
+		ADDw.z		VF20,VF31,VF23w		NOP
+		
+		
+		; store the rearranged occluders
+		
+		NOP								SQI			VF04,(VI02++)
+		NOP								SQI			VF01,(VI02++)
+		NOP								SQI			VF02,(VI02++)
+		NOP								SQI			VF03,(VI02++)
+		NOP								SQI			VF08,(VI02++)
+		NOP								SQI			VF05,(VI02++)
+		NOP								SQI			VF06,(VI02++)
+		NOP								SQI			VF07,(VI02++)
+		NOP								SQI			VF12,(VI02++)
+		NOP								SQI			VF09,(VI02++)
+		NOP								SQI			VF10,(VI02++)
+		NOP								SQI			VF11,(VI02++)
+		NOP								SQI			VF16,(VI02++)
+		NOP								SQI			VF13,(VI02++)
+		NOP								SQI			VF14,(VI02++)
+		NOP								SQI			VF15,(VI02++)
+		NOP								SQI			VF20,(VI02++)
+		NOP								SQI			VF17,(VI02++)
+		NOP								SQI			VF18,(VI02++)
+		NOP								SQI			VF19,(VI02++)
+		
+		
+		; loop if we haven't just processed the sentinel planes
+		
+		NOP								ISUB		VI01,VI02,VI05
+		NOP								NOP
+		NOP								IBLTZ		VI01,MemLoop
+		NOP								NOP
+		
+		; quit
+		NOP[E]							NOP
+		NOP								NOP
+		
+		
+;-----------------------------------------------------------------------------------------------------------------------------
+
+
+TestSphereAgainstOccluders:		
+
+		; sphere is in VF07 as (x,y,z,R)
+		; for each plane p, we must compute px*x + py*w + pz*z + pw + R
+		; uses a sentinel occluder to terminate
+
+		NOP								IADDIU		VI02,VI00,0			; initialise pointer
+
+		; loop prologue
+		ADD.y		VF05,VF00,VF00		LQI			VF04,(VI02++)
+		NOP								LQI			VF01,(VI02++)
+		NOP								LQI			VF02,(VI02++)
+		NOP								LQI			VF03,(VI02++)
+		ADDAw		ACC,VF04,VF07w		LQI			VF04,(VI02++)
+		MADDAx		ACC,VF01,VF07x		LQI			VF01,(VI02++)
+		MADDAy		ACC,VF02,VF07y		LQI			VF02,(VI02++)
+		MADDz		VF00,VF03,VF07z		IADDIU		VI10,VI00,0xF0		; VI10 = mask for Sxyzw FMAC flags
+		
+		; main loop, tests 4 occluders (20 planes) per pass
+Loop:	ADDw.y		VF05,VF05,VF00w		LQI			VF03,(VI02++)
+		ADDAw		ACC,VF04,VF07w		LQI			VF04,(VI02++)
+		MADDAx		ACC,VF01,VF07x		LQI			VF01,(VI02++)
+		MADDAy		ACC,VF02,VF07y		FMAND		VI01,VI10
+		MADDz		VF00,VF03,VF07z		LQI			VF02,(VI02++)
+		ADDw.y		VF05,VF05,VF00w		LQI			VF03,(VI02++)
+		ADDAw		ACC,VF04,VF07w		LQI			VF04,(VI02++)
+		MADDAx		ACC,VF01,VF07x		LQI			VF01,(VI02++)
+		MADDAy		ACC,VF02,VF07y		FMAND		VI01,VI01
+		MADDz		VF00,VF03,VF07z		LQI			VF02,(VI02++)
+		ADDw.y		VF05,VF05,VF00w		LQI			VF03,(VI02++)
+		ADDAw		ACC,VF04,VF07w		LQI			VF04,(VI02++)
+		MADDAx		ACC,VF01,VF07x		LQI			VF01,(VI02++)
+		MADDAy		ACC,VF02,VF07y		FMAND		VI01,VI01
+		MADDz		VF00,VF03,VF07z		LQI			VF02,(VI02++)
+		ADDw.y		VF05,VF05,VF00w		LQI			VF03,(VI02++)
+		ADDAw		ACC,VF04,VF07w		LQI			VF04,(VI02++)
+		MADDAx		ACC,VF01,VF07x		LQI			VF01,(VI02++)
+		MADDAy		ACC,VF02,VF07y		FMAND		VI01,VI01
+		MADDz		VF00,VF03,VF07z		LQI			VF02,(VI02++)
+		FTOI0.y		VF06,VF05			LQI			VF03,(VI02++)
+		ADDAw		ACC,VF04,VF07w		LQI			VF04,(VI02++)
+		MADDAx		ACC,VF01,VF07x		LQI			VF01,(VI02++)
+		MADDAy		ACC,VF02,VF07y		FMAND		VI01,VI01
+		NOP								IBEQ		VI01,VI00,Loop
+		MADDz		VF00,VF03,VF07z		LQI			VF02,(VI02++)
+		
+		; (macflags & 0x80) => possible occluder in 1st slot of group of 4
+		NOP								ISUBIU		VI10,VI01,0x80
+		NOP								MTIR		VI06,VF06y
+		NOP								IBGEZ		VI10,TestForSentinel
+		NOP								ISUBIU		VI03,VI02,22
+		
+		; (macflags & 0x40) => possible occluder in 2nd slot of group of 4
+		NOP								ISUBIU		VI10,VI01,0x40
+		NOP								IADDIU		VI06,VI06,1
+		NOP								IBGEZ		VI10,TestForSentinel
+		NOP								ISUBIU		VI03,VI02,17
+		
+		; (macflags & 0x20) => possible occluder in 3rd slot of group of 4
+		NOP								ISUBIU		VI10,VI01,0x20
+		NOP								IADDIU		VI06,VI06,1
+		NOP								IBGEZ		VI10,TestForSentinel
+		NOP								ISUBIU		VI03,VI02,12
+		
+		; (macflags & 0x10) => possible occluder in 4th slot of group of 4
+		NOP								IADDIU		VI06,VI06,1
+		NOP								ISUBIU		VI03,VI02,7
+		
+TestForSentinel:
+		; sentinel if VI03==VI05, else occluded
+		NOP[E]							ISUB		VI01,VI03,VI05
+		NOP								ISUBIU		VI06,VI06,4
+		
+;-----------------------------------------------------------------------------------------------------------------------------
+
+BatchRayTriangleCollision:
+		NOP								ILW.y		VI04, 0(VI00)		; total number of collision tests
+		NOP								ILW.x		VI05, 0(VI00)		; starting index
+
+		NOP                 			IADDIU 		VI01, VI00, 0		; init number of found collisions
+		NOP                 			IADDIU 		VI03, VI00, 1		; init address
+		NOP                 			IADD 		VI06, VI00, VI03	; init output address (writes over input)
+
+		NOP								ISUB		VI04, VI04, VI05	; decrement the start index from the array size
+
+		NOP								LQ			VF06, 2(VI03)		; v0
+		NOP								LQ			VF08, 4(VI03)		; v2
+		NOP								LQ			VF07, 3(VI03)		; v1
+		NOP								LQ			VF04, 0(VI03)		; rayStart
+		NOP								LQ			VF05, 1(VI03)		; rayDir
+   
+NextCollision:
+		SUB.xyz     VF10, VF08, VF06	NOP							   	; edge2 = v2 - v0
+		SUB.xyz     VF09, VF07, VF06	MFIR.w		VF17w, VI05   		; edge1 = v1 - v0  ; store index in VF17w (output)
+		SUB.xyz     VF13, VF04, VF06	FSSET 0							; tvec = rayStart - v0
+		ADDW.x      VF02, VF00, VF00w	LOI 1.00001						; Load 1.0f to VF02x ; load 1 + EPSILON into I
+
+		OPMULA.xyz  ACC, VF05, VF10		NOP								; Cross product of ray normal and edge2 (pvec)
+		OPMSUB.xyz  VF12,VF10, VF05		NOP								; Second part of cross product
+		OPMULA.xyz  ACC, VF13, VF09     IADDIU      VI14, VI00, 0x80    ; qvec = crossProd(tvec, edge1) ; Set the mask X sign flag
+		OPMSUB.xyz  VF14,VF09, VF13     IADDIU      VI13, VI00, 0x10	; Set the mask W sign flag
+		SUBi.x		VF03,VF00, I		NOP								; put -(1 + EPSILON) in VF03x
+
+		MUL.xyz     VF11,VF09, VF12		NOP								; det = edge1 * pvec [start]
+		MUL.xyz     VF15,VF13, VF12		NOP								; u = tvec * pvec [start]
+		MULAx.x     ACC, VF09, VF12x	IADDI		VI04, VI04, -1		; decrement number of collision tests
+		MADDAy.x    ACC, VF02, VF11y	IADDIU 		VI03, VI03, 5		; increment address
+		MADDz.x     VF11,VF02, VF11z	NOP								; det = edge1 * pvec [ready]
+		MULAx.x     ACC, VF02, VF15x	LOI 0.00001						; load 1 + EPSILON into I
+		MADDAy.x    ACC, VF02, VF15y	LQ			VF04, 0(VI03)		; next rayStart
+		MUL.xyz		VF17,VF10, VF14		NOP								; t = edge2 * qvec [start]
+		SUBi.x      VF01,VF11, I  		DIV 	    Q,   VF00w,VF11x	; If det < EPSILON ; Q = 1.0f / det
+
+		MADDz.x     VF15,VF02, VF15z	LQ			VF06, 2(VI03)		; u = tvec * pvec [ready] ; next v0
+		MULAx.x		ACC, VF10, VF14x	LQ			VF08, 4(VI03)		; next v2
+		MADDAy.x	ACC, VF02, VF17		LQ			VF07, 3(VI03)		; next v1
+        MUL.xyz		VF16,VF05, VF14     FMAND 		VI15,VI14 			; v = rayDir * qvec [start] ; check if det result (MAC register)
+        MADDz.x		VF17,VF02, VF17z 	IBNE 		VI15,VI00,BatchRayTriDone	; t = edge2 * qvec [ready]
+		MULAx.x		ACC, VF05, VF14x	LQ			VF05, 1(VI03)		; next rayDir
+		MULQ.x		VF15,VF15, Q        NOP								; u = (tvec * pvec) / det
+		MADDAy.x	ACC, VF02, VF16		NOP
+		MADDz.x		VF16,VF02, VF16z    NOP								; v = rayDir * qvec [ready]
+		NOP								NOP								
+
+		ADDx.x		VF00,VF15, VF03x	FMAND 		VI15,VI14			; if u > 1 + EPSILON ; check if u result (MAC register)  
+		NOP								IBNE		VI15,VI00,BatchRayTriDone
+		MULQ.x		VF16,VF16, Q		NOP								; v = (rayDir * qvec) / det;
+		MULQ.x		VF17,VF17, Q        NOP								; t = (edge2 * qvec) / det
+        NOP								FMAND 		VI15,VI14      		; check if u > 1 + EPSILON result (MAC register)
+        NOP							    IBEQ		VI15,VI00,BatchRayTriDone
+
+        ADDA.x		ACC ,VF15, VF16   	FMAND 		VI15,VI14      		; check if v < 0 result (MAC register)
+        MADDw.x     VF31,VF03, VF00w    IBNE 		VI15,VI00,BatchRayTriDone ; if (u+v) > 1 + EPSILON [start]
+
+		NOP								NOP
+		SUB.x		VF00,VF17, VF00		NOP
+		NOP								NOP
+        SUBx.w		VF00,VF00, VF17 	FMAND 		VI15,VI14     		; if t > 1 [start] ; check if u+v > 1 + EPSILON result (MAC register)
+		NOP								IBEQ 		VI15,VI00,BatchRayTriDone	
+
+		NOP							    FMAND 		VI15,VI14			; check if t < 0 result (MAC register) 	  	
+        NOP                             IBNE 		VI15,VI00,BatchRayTriDone
+
+        NOP								FMAND 		VI15,VI13          	; check if t > 1 result (MAC register)
+        NOP                             IBNE 		VI15,VI00,BatchRayTriDone
+		NOP								NOP
+
+		NOP								SQI.xw		VF17, (VI06++)		; store distance (x) and index (w)
+		NOP                 			IADDIU 		VI01, VI01, 1		; inc number of found collisions
+
+BatchRayTriDone:
+        NOP                             IBNE 		VI04, VI00,NextCollision
+		NOP								IADDIU		VI05, VI05, 1		; increment index for output
+
+		NOP[T]							NOP
+		NOP								NOP
+
+RayTriangleCollision:
+
+		SUB.xyz     VF10, VF08, VF06	NOP								; edge2 = v2 - v0
+		SUB.xyz     VF09, VF07, VF06	FSSET 0							; edge1 = v1 - v0 
+		SUB.xyz     VF13, VF04, VF06	NOP								; tvec = rayStart - v0
+		ADDW.x      VF02, VF00, VF00w	LOI 1.00001						; Load 1.0f to VF02x ; load 1 + EPSILON into I
+
+		OPMULA.xyz  ACC, VF05, VF10		NOP								; Cross product of ray normal and edge2 (pvec)
+		OPMSUB.xyz  VF12,VF10, VF05		NOP								; Second part of cross product
+		OPMULA.xyz  ACC, VF13, VF09     IADDIU      VI14, VI00, 0x80    ; qvec = crossProd(tvec, edge1) ; Set the mask X sign flag
+		OPMSUB.xyz  VF14,VF09, VF13     IADDIU      VI13, VI00, 0x10	; Set the mask W sign flag
+		SUBi.x		VF03,VF00, I		IADDIU 		VI02, VI00, 0		; put -(1 + EPSILON) in VF03x ; store 0 for return value
+
+		MUL.xyz     VF11,VF09, VF12		NOP								; det = edge1 * pvec [start]
+		MUL.xyz     VF15,VF13, VF12		NOP								; u = tvec * pvec [start]
+		MULAx.x     ACC, VF09, VF12x	NOP
+		MADDAy.x    ACC, VF02, VF11y	NOP
+		MADDz.x     VF11,VF02, VF11z	NOP								; det = edge1 * pvec [ready]
+		MULAx.x     ACC, VF02, VF15x	LOI 0.00001						; load 1 + EPSILON into I
+		MADDAy.x    ACC, VF02, VF15y	NOP
+		MUL.xyz		VF17,VF10, VF14		NOP								; t = edge2 * qvec [start]
+		SUBi.x      VF01,VF11, I  		DIV 	    Q,   VF00w,VF11x	; If det < EPSILON ; Q = 1.0f / det
+
+		MADDz.x     VF15,VF02, VF15z	NOP								; u = tvec * pvec [ready]
+		MULAx.x		ACC, VF10, VF14x	NOP
+		MADDAy.x	ACC, VF02, VF17		NOP
+        MUL.xyz		VF16,VF05, VF14     FMAND 		VI15,VI14 			; v = rayDir * qvec [start] ; check if det result (MAC register)
+        MADDz.x		VF17,VF02, VF17z 	IBNE 		VI15,VI00,vu0RayTriDone	; t = edge2 * qvec [ready]
+		MULAx.x		ACC, VF05, VF14x	NOP
+		MULQ.x		VF15,VF15, Q        NOP								; u = (tvec * pvec) / det
+		MADDAy.x	ACC, VF02, VF16		NOP
+		MADDz.x		VF16,VF02, VF16z    NOP								; v = rayDir * qvec [ready]
+		NOP								NOP								
+
+		ADDx.x		VF00,VF15, VF03x	FMAND 		VI15,VI14			; if u > 1 + EPSILON ; check if u result (MAC register)  
+		NOP								IBNE		VI15,VI00,vu0RayTriDone
+		MULQ.x		VF16,VF16, Q		NOP								; v = (rayDir * qvec) / det;
+		MULQ.x		VF17,VF17, Q        NOP								; t = (edge2 * qvec) / det
+        NOP								FMAND 		VI15,VI14      		; check if u > 1 + EPSILON result (MAC register)
+        NOP							    IBEQ		VI15,VI00,vu0RayTriDone
+
+        ADDA.x		ACC ,VF15, VF16   	FMAND 		VI15,VI14      		; check if v < 0 result (MAC register)
+        MADDw.x     VF31,VF03, VF00w    IBNE 		VI15,VI00,vu0RayTriDone ; if (u+v) > 1 + EPSILON [start]
+
+		NOP								NOP
+		SUB.x		VF00,VF17, VF00		NOP
+		NOP								NOP
+        SUBx.w		VF00,VF00, VF17 	FMAND 		VI15,VI14     		; if t > 1 [start] ; check if u+v > 1 + EPSILON result (MAC register)
+		NOP								IBEQ 		VI15,VI00,vu0RayTriDone	
+
+		NOP							    FMAND 		VI15,VI14			; check if t < 0 result (MAC register) 	  	
+        NOP                             IBNE 		VI15,VI00,vu0RayTriDone
+
+        NOP								FMAND 		VI15,VI13          	; check if t > 1 result (MAC register)
+        NOP                             IBNE 		VI15,VI00,vu0RayTriDone
+		NOP								NOP
+
+	;qmfc2	$9, $vf17			 # move t to $9
+	;sw		$9, 0(%1)			 # and write out
+		NOP								IADDIU 		VI02, VI00, 1		; store 1 for return value
+
+vu0RayTriDone:
+
+		NOP[E]							NOP
+		NOP								NOP
+
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; new bounding volume / frustum intersection tests
+
+
+		; VF08 = (x0,y0,z0,r)
+		; VF09 = (bx,by,bz,?)
+		
+		; VF10 = (nx)
+		; VF11 = (ny)
+		; VF12 = (nz)
+		; VF13 = (|nx|)
+		; VF14 = (|ny|)
+		; VF15 = (|nz|)
+		; VF16 = (nw)
+		
+		; VF17 = (nx)
+		; VF18 = (ny)
+		; VF19 = (nz)
+		; VF20 = (|nx|)
+		; VF21 = (|ny|)
+		; VF22 = (|nz|)
+		; VF23 = (nw)
+		
+		; VF24 = (nx)
+		; VF25 = (ny)
+		; VF26 = (nz)
+		; VF27 = (|nx|)
+		; VF28 = (|ny|)
+		; VF29 = (|nz|)
+		; VF30 = (nw)
+		
+		; VF31 = (1)
+
+		
+ViewCullTest:
+		
+		ADDAx		ACC,VF16,VF00x		NOP
+		MADDAx		ACC,VF10,VF08x		NOP
+		MADDAy		ACC,VF11,VF08y		NOP
+		MADDAz		ACC,VF12,VF08z		NOP
+		MADDw		VF00,VF31,VF08w		NOP
+		MADDAx		ACC,VF13,VF09x		NOP
+		MADDAy		ACC,VF14,VF09y		NOP
+		MADDz		VF00,VF15,VF09z		NOP
+		
+		ADDAx.xy	ACC,VF23,VF00x		FMOR		VI01,VI00
+		MADDAx.xy	ACC,VF17,VF08x		NOP
+		MADDAy.xy	ACC,VF18,VF08y		NOP
+		MADDAz.xy	ACC,VF19,VF08z		FMOR		VI01,VI01
+		MADDw.xy	VF00,VF31,VF08w		NOP
+		MADDAx.xy	ACC,VF20,VF09x		NOP
+		MADDAy.xy	ACC,VF21,VF09y		NOP
+		MADDz.xy	VF00,VF22,VF09z		NOP
+		
+		NOP								FMOR		VI01,VI01
+		NOP								NOP
+		NOP								NOP
+		NOP[E]							FMOR		VI01,VI01
+		NOP								NOP
+		
+
+OuterCullTest:
+
+		ADDAx.zw	ACC,VF23,VF00x		NOP
+		MADDAx.zw	ACC,VF17,VF08x		NOP
+		MADDAy.zw	ACC,VF18,VF08y		NOP
+		MADDAz.zw	ACC,VF19,VF08z		NOP
+		MSUBw.zw	VF00,VF31,VF08w		NOP
+		MSUBAx.zw	ACC,VF20,VF09x		NOP
+		MSUBAy.zw	ACC,VF21,VF09y		NOP
+		MSUBz.zw	VF00,VF22,VF09z		NOP
+		
+		ADDAx		ACC,VF30,VF00x		FMOR		VI01,VI00
+		MADDAx		ACC,VF24,VF08x		NOP
+		MADDAy		ACC,VF25,VF08y		NOP
+		MADDAz		ACC,VF26,VF08z		FMOR		VI01,VI01
+		MSUBw		VF00,VF31,VF08w		NOP
+		MSUBAx		ACC,VF27,VF09x		NOP
+		MSUBAy		ACC,VF28,VF09y		NOP
+		MSUBz		VF00,VF29,VF09z		NOP
+		
+		NOP								FMOR		VI01,VI01
+		NOP								NOP
+		NOP								NOP
+		NOP[E]							FMOR		VI01,VI01
+		NOP								NOP
+
+
+BothCullTests:
+		
+		MULAx.zw	ACC,VF20,VF09x		NOP
+		MADDAy.zw	ACC,VF21,VF09y		NOP
+		MADDz.zw	VF01,VF22,VF09z		NOP
+		
+		ADDAx		ACC,VF16,VF00x		NOP
+		MADDAx		ACC,VF10,VF08x		NOP
+		MADDAy		ACC,VF11,VF08y		NOP
+		MADDAz		ACC,VF12,VF08z		NOP
+		MADDw		VF00,VF31,VF08w		NOP
+		MADDAx		ACC,VF13,VF09x		NOP
+		MADDAy		ACC,VF14,VF09y		NOP
+		MADDz		VF00,VF15,VF09z		NOP
+		
+		ADDAx.zw	ACC,VF23,VF00x		FMOR		VI01,VI00
+		MADDAx.zw	ACC,VF17,VF08x		NOP
+		MADDAy.zw	ACC,VF18,VF08y		NOP
+		MADDAz.zw	ACC,VF19,VF08z		FMOR		VI01,VI01
+		MADDx.z		VF05,VF00,VF00x		NOP
+		MADDw.zw	VF00,VF31,VF08w		NOP
+		MADDw.zw	VF00,VF01,VF00w		NOP
+		MSUBw.zw	VF00,VF31,VF08w		NOP
+		MSUBw.zw	VF00,VF01,VF00w		NOP
+		
+		ADDAx		ACC,VF30,VF00x		FMOR		VI01,VI01
+		MADDAx		ACC,VF24,VF08x		FMOR		VI01,VI01
+		MADDAy		ACC,VF25,VF08y		FMOR		VI11,VI00
+		MADDAz		ACC,VF26,VF08z		FMOR		VI11,VI11
+		MSUBw		VF00,VF31,VF08w		NOP
+		MSUBAx		ACC,VF27,VF09x		NOP
+		MSUBAy		ACC,VF28,VF09y		NOP
+		MSUBz		VF00,VF29,VF09z		NOP
+		
+		SUBz.x		VF05,VF00,VF05z		FMOR		VI11,VI11
+		NOP								NOP
+		NOP								NOP
+		NOP								FMOR		VI11,VI11
+		
+		NOP[E]							NOP
+		NOP								NOP
+
+
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+
+.EndMPG
+
+MPGEnd0:

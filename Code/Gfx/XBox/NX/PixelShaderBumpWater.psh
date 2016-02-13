@@ -1,0 +1,9 @@
+xps.1.1
+
+tex		t0
+texbem	t1, t0
+mul		t1.rgb,t1.rgb,c0.rgb	; Modulate texture1 color with material color0
+mul_x4	r0.rgb,v0.rgb,t1.rgb	; Modulate (x4) resultant color with vertex color
++mul_x2	r0.a,v0.a,t1.a			; Modulate (x2) result alpha with vertex alpha
+
+xfc prod, fog.rgb, sum, zero, 1 - fog.a, c4, r0.a

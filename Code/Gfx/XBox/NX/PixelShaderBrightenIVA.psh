@@ -1,0 +1,10 @@
+xps.1.1
+
+tex t0
+;mul		t0.rgb,t0.rgb,c0.rgb	; Modulate texture color0 with material color0
+;mul_x4		r0.rgb,v0.rgb,t0.rgb	; Modulate (x4) resultant color with vertex color
+;+mul_x2	r0.a,c4.a,t0.a			; Modulate (x2) result alpha with constant alpha
+
+mul_x2		r0,c4.a,t0.a			; Modulate (x2) result alpha with constant alpha and copy into all 4 channels
+
+xfc prod, fog.rgb, sum, zero, 1 - fog.a, c4, r0.a

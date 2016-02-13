@@ -1,0 +1,299 @@
+
+; -----------------
+; VU1 PARTICLE CODE
+; -----------------
+
+
+; to do:
+; - lift restriction on number of particles per system (ie allow one system to span multiple VU1 'buffers')
+; - cyclic paths?
+
+
+; notes:
+; the arrangement of VU1 memory accesses should be done in consideration of the low amount of VIF1 activity per system
+
+
+; VU1's (crap) random number generator uses this algorithm:
+;
+; R = 0x3F800000		|
+;     R<<1 & 0x007FFFFF	|
+;     (R>>4 ^ R>>22) & 1
+;
+; This is augmented by a few xor's and a history of 4 seeds (which we sort of need anyway, to do random vectors),
+; to give fairly decent random numbers. If VF13 holds the 4-vector of seeds, the following code steps to the next
+; set of 4 values:
+;
+;		RNEXT.x		VF13,R
+;		RXOR		R,VF13y
+;		RGET.y		VF13,R
+;		RXOR		R,VF13z
+;		RGET.z		VF13,R
+;		RXOR		R,VF13w
+;		RGET.w		VF13,R
+;
+; But this code is also efficiently emulated on the cpu, which is crucial.
+
+
+
+GS_BUF0 = 512
+GS_BUF1 = 768
+OUT_MAXNUM = 42
+
+
+
+
+; output sprite format is (STQ,RGBA,XYZ2,UV,XYZ2)
+
+
+		; per stream
+		.equr	t,		VF09			; (t,dt,num_particles,?,)
+		.equr	seed,	VF10			; (Rx,Ry,Rz,Rw)
+		
+		; per system
+		.equr	uv1,	VF11			; (u1,v1,?,?)
+		.equr	uv0,	VF12			; (u0,v0,?,?)
+		.equr	p0,		VF13			; t^0 position coefficient
+		.equr	p1,		VF14			; t^1 position coefficient
+		.equr	p2,		VF15			; t^2 position coefficient
+		.equr	s0,		VF17			; t^0 spread coefficient
+		.equr	s1,		VF18			; t^1 spread coefficient
+		.equr	s2,		VF19			; t^2 spread coefficient
+		.equr	c0,		VF21			; t^0 colour coefficient
+		.equr	c1,		VF22			; t^1 colour coefficient
+		.equr	c2,		VF23			; t^1 colour coefficient
+		.equr	tag,	VF24			; GIFtag for particle GS packets
+
+		; constant
+		.equr	kvec,	VF25			; scale vec (kx,ky,0,0)
+		.equr	NTLvec,	VF26			; near-top-left cull testing vec
+		.equr	BRvec,	VF27			; far-bottom-right cull testing vec
+		.equr	mat0,	VF28			; view matrix row 0
+		.equr	mat1,	VF29			; view matrix row 1
+		.equr	mat2,	VF30			; view matrix row 2
+		.equr	mat3,	VF31			; view matrix row 3
+
+		; integer regs
+		.equr	Input,	VI02
+		.equr	Output,	VI03
+		.equr	Flip,	VI12
+		.equr	Packet,	VI13
+		
+
+
+		.scope
+
+
+SpritesInit:
+
+		; get input buffer address
+		NOP								XTOP		Input
+		
+		; load constant data
+		NOP								LQI			mat0,  (Input++)	; view matrix row 0
+		NOP								LQI			mat1,  (Input++)	; view matrix row 1
+		NOP								LQI			mat2,  (Input++)	; view matrix row 2
+		NOP								LQI			mat3,  (Input++)	; view matrix row 3
+		NOP								LQI			kvec,  (Input++)	; scale vec (kx,ky,0,0)
+		NOP								LQI			NTLvec,(Input++)	; near-top-left cull testing vec
+		NOP								LQI			BRvec,(Input++)		; bottom-right cull testing vec
+
+		NOP[E]							IADDIU		Packet,VI00,GS_BUF0
+		NOP								IADDIU		Flip,Packet,GS_BUF1
+
+
+
+Sprites:
+
+		NOP								NOP
+		NOP								NOP
+
+		; get input buffer address
+		NOP								XTOP		Input
+		
+		; kick GS context and step over it
+		NOP								ILW.x		VI01,0(Input)
+		NOP								XGKICK		Input
+		NOP								ISUBIU		Input,Input,0x7FFF
+		NOP								IADD		Input,Input,VI01
+
+		; load the context data for the system
+		NOP								LQI			uv0,(Input++)		; (u0,v0,u1,v1)
+		NOP								LQI			p0, (Input++)		; t^0 position coefficient
+		NOP								LQI			p1, (Input++)		; t^1 position coefficient
+		NOP								LQI			p2, (Input++)		; t^2 position coefficient
+		NOP								LQI			s0, (Input++)		; t^0 spread coefficient
+		NOP								LQI			s1, (Input++)		; t^1 spread coefficient
+		NOP								LQI			s2, (Input++)		; t^2 spread coefficient
+		NOP								LQI			c0, (Input++)		; 
+		NOP								LQI			c1, (Input++)		; 
+		NOP								LQI			c2, (Input++)		; 
+		NOP								LQI			tag,(Input++)		; GIFtag for particle GS packets
+
+
+		; a little bit of reformatting
+		NOP								MR32		uv1,uv0
+		NOP								MR32		uv1,uv1
+
+		; copy tag to packet buffers
+		NOP								SQ			tag,GS_BUF0(VI00)
+		NOP								SQ			tag,GS_BUF1(VI00)
+
+@StreamLoop:
+
+		; load stream data
+		NOP								LQI			t,(Input++)			; t_oldest, dt, num_particles, terminator
+		NOP								LQI			seed,(Input++)
+
+		; seed initialisation
+		NOP								RINIT		R,seed.w
+
+		; To start with, just pack each buffer full until we run out. This will usually end with a half-full buffer.
+		; Later we can work out the ideal packet size to even out the cost.
+		
+		; get num particles
+		NOP								MTIR		VI06,t.z
+
+@PacketLoop:
+
+		; set output pointer
+		NOP								IADDIU		Output,Packet,1
+		
+		; see if they'll all fit
+		NOP								ISUBIU		VI01,VI06,OUT_MAXNUM
+		NOP								NOP
+		NOP								IBGTZ		VI01,@WontFit
+		NOP								NOP
+
+@WillFit:
+		NOP								B			@Reduce
+		NOP								IADDIU		VI05,VI06,0
+
+@WontFit:
+		NOP								IADDIU		VI05,VI00,OUT_MAXNUM
+
+@Reduce:
+		NOP								ISUB		VI06,VI06,VI05
+		NOP								IBEQ		VI05,VI00,@NextStream
+		NOP								IADDIU		VI01,VI05,0x4000
+		NOP								IADDIU		VI01,VI01,0x4000
+		NOP								ISW.x		VI01,0(Packet)
+
+@ParticleLoop:
+
+		; generate new seed vector
+		NOP								RNEXT.x		seed,R
+		NOP								RXOR		R,seed.y
+		NOP								RGET.y		seed,R
+		NOP								RXOR		R,seed.z
+		NOP								RGET.z		seed,R
+		NOP								RXOR		R,seed.w
+		NOP								RGET.w		seed,R
+
+		; compute p0+s0*seed + t(p1+s1*seed) + t^2(p2+s2*seed) + t^3(p3+s3*seed)
+		; = (((p3+s3*seed)t + p2+s2*seed)t + p1+s1*seed)t + p0+s0*seed
+
+		ADDAx		ACC,p2,zero			NOP
+		MADD		VF02,s2,seed		NOP
+		NOP								NOP
+		ADDAx		ACC,p1,zero			NOP
+		MADDA		ACC,s1,seed			NOP
+		MADDx		VF02,VF02,t.x		NOP
+		NOP								NOP
+		ADDAx		ACC,p0,zero			NOP
+		MADDA		ACC,s0,seed			NOP
+		MADDx		VF02,VF02,t.x		NOP
+		
+		; VF02 = (x,y,z,r)
+		
+		; transform and add corner offsets
+		ADDAx		ACC,mat3,zero		NOP
+		MADDAx		ACC,mat0,VF02x		NOP
+		MADDAy		ACC,mat1,VF02y		NOP
+		MADDAz		ACC,mat2,VF02z		NOP
+		MSUBw		VF01,kvec,VF02w		NOP
+		MADDw.xyz	VF02,kvec,VF02w		NOP
+		
+		; VF01 = (x'-kx*r, y'-ky*r, z', w)
+		; VF02 = (x'+kx*r, y'+ky*r, z', r)
+		
+		; calc 1/w
+		NOP								DIV			Q,one,VF01w
+		NOP								WAITQ
+		
+		; prepare for cull tests, move r to NTL vec
+		NOP								MOVE.w		NTLvec,VF02
+		
+		; generate screen coords of corners
+		MULq.xyz	VF01,VF01,Q			NOP
+		MULq		VF02,VF02,Q			NOP
+
+		; VF01 = (X0,Y0,Z0,w)
+		; VF02 = (X1,Y1,Z1,r/w) - r/w is only used for mipmapping
+
+		; get (GS) Q
+		NOP								MR32.z		VF03,VF02
+
+		; compute colour
+		SUB.x		VF06,t,tag			NOP			; subtract mid time
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								FMOR		VI01,VI00
+		NOP								IBEQ		VI01,VI00,tPos
+		NOP								NOP
+		
+tNeg:	ADDAx		ACC,c1,zero			NOP
+		MADDx		VF06,c0,VF06x		NOP
+		NOP								B			tDone
+		NOP								NOP
+		
+tPos:	ADDAx		ACC,c1,zero			NOP
+		MADDx		VF06,c2,VF06x		NOP
+
+tDone:	FTOI0		VF06,VF06			NOP
+
+		; decrement t (remember we started with the oldest particle!)
+		SUBy.x		t,t,t.y				NOP
+		
+		; cull tests
+		SUB.xyw		VF00,VF01,NTLvec	NOP
+		SUB.xy		VF00,BRvec,VF02		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								FMOR		VI01,VI00
+		NOP								FMOR		VI01,VI01
+		NOP								IADDIU		VI01,VI01,0x7FFF
+		NOP								MFIR.w		VF02,VI01
+		
+		; store stuff
+		NOP								SQI.z		VF03,(Output++)
+		NOP								SQI			VF06,(Output++)
+		NOP								SQI.xy		uv0, (Output++)
+		NOP								SQI.xyz		VF01,(Output++)
+		NOP								SQI			uv1, (Output++)
+		NOP								SQI			VF02,(Output++)
+		
+		; dec counter and loop inner
+		NOP								ISUBIU		VI05,VI05,1
+		NOP								NOP
+		NOP								IBNE		VI05,VI00,@ParticleLoop
+		NOP								NOP
+
+		; kick and flip
+		NOP								XGKICK		Packet
+		NOP								ISUB		Packet,Flip,Packet
+
+		; loop outer
+		NOP								IBGTZ		VI06,@PacketLoop
+		NOP								NOP
+		
+@NextStream:
+		NOP								MTIR		VI01,t.w
+		NOP								NOP
+		NOP								IBGEZ		VI01,@StreamLoop
+		NOP								NOP
+
+@Done:	NOP[E]							NOP
+		NOP								NOP
+
+		.endscope

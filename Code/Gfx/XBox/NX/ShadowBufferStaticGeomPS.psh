@@ -1,0 +1,15 @@
+;Shadowbuffer pixel shader.
+
+xps.1.1
+
+def c7, 0.6f, 0.6f, 0.6f, 0.0f
+
+tex t0							; Base geometry texture (for alpha modulation).
+tex t1							; Shadow depth buffer texture.
+
+; White texture (outside of skater) we don't want to draw - so negate blue component into alpha.
+; This way the white part of the texture will have zero alpha, the black part will have full alpha.
+
+mul		r0.a, 1-t1.b, t0.a		; Modulate shadow alpha with base texture alpha (to neatly deal with holes in texture).
++add	r0.rgb, t1.rgb, c7.rgb	; Add in the ambient component to brighten up the shadow a bit.
+

@@ -1,0 +1,5809 @@
+;
+; set tab stops to 4 to read this file
+;
+;-----------------------------------------------------------------------------------------------------------------------------
+; The result of assembling this file is a set of vif packets with vifcode MPG, used to upload
+; microcode to MicroMem1, the 16K program memory of VU1. There is only one MPG assembler
+; directive, but this is clever enough to split the assembled code into multiple packets when
+; the maximum MPG packet size (256 64-bit instruction slots, 2K of program) is exceeded.
+; There will be the need to manage multiple sets of microcode, once there's more than 16K
+; total.
+;
+;-----------------------------------------------------------------------------------------------------------------------------
+;
+; Very brief overview of rendering scheme
+; ---------------------------------------
+;
+; I decided where possible to take a 'process-in-place' approach to basic triangle rendering.
+; e.g. a pair of texture coordinates loaded to address 100 in VU memory will end up being
+; output as a pair of texture coordinates from the same address, on its way to the GS. This
+; is efficient because it reduces the amount of data copying, as sometimes the VU doesn't
+; need to touch the data - e.g. vertex colours can sometimes pass straight through without
+; further processing.
+;
+; This means the data should be at least triple-buffered for maximum efficiency, since there
+; are 3 processes that can run in parallel - sending data into memory via VIF1, processing
+; the data using VU1, and sending data out through the GIF to the GS. For maximum flexibility,
+; I have chosen to use VUMem1 (the VU1 data memory) as a cyclic buffer, letting the data
+; packets themselves ensure that the triple-buffering rule is not violated. (This is an
+; original approach - generally people use fixed buffers.)
+;
+; The result of processing renderable data in VU1 will be a GS packet (see EE User's Manual,
+; section 7.2, "Data Format"). Each GS packet is composed of GS primitives which begin with
+; a GIFtag. Following through to the max on the 'process-in-place' philosophy, I consider the
+; incoming geometry data to also consist of packets made up of primitives, each with a tag.
+; The tag is a superset of the GIFtag, appearing to the GIF as a valid GIFtag but making use
+; of the many unused bits of the GIFtag to signal additional info to VU1, eg the size of the
+; packet, the address of the microcode that should be used to process the packet, etc.
+; (This is also a pretty nifty idea, although using the spare bits is common practice.)
+;
+; There are 3 varieties of primitive - a VU prim, containing contextual VU data that will be
+; loaded into floating point VU1 registers (which doesn't need kicking to the GS), a GS prim,
+; containing contextual GS data that won't be touched by the VU but will be kicked directly
+; to the GS where it will set some of the GS registers, and finally a geometry prim which
+; contains renderable geometry and will be processed by the rendering code into a GS prim
+; that outputs something on the screen. But all varieties of prim use a common tag format so
+; they can be freely mixed in the data and parsed by a common piece of code.
+;
+;-----------------------------------------------------------------------------------------------------------------------------
+; Registers used in the main parsing loop and in the renderers (all except for the clipping code)
+;
+; Integer registers:
+; VI00 - the constant zero register, always zero (doesn't change if you write something else to it)
+; VI01 - mainly temporary values, also hardwired as the result of the FCAND, FCEQ, FCOR instructions
+; VI02 - the data pointer as the prims are parsed
+; VI03 - an auxilliary data pointer, so that data can be read from one vertex while writing to another
+; VI04 - number of quadwords in each vertex of the current prim
+; VI05 - end address for the current prim
+; VI06 - size of the current prim
+; VI07 - \
+; VI08 - \\
+; VI09 - -- temporaries
+; VI10 - //
+; VI11 - /
+; VI12 - address of current tag
+; VI13 - address of packet start
+; VI14 - render flags
+; VI15 - EOP:NLOOP from current tag
+
+; VF00 - the constant register (0,0,0,1) (doesn't change if you write something else to it)
+; VF01 - temporary value
+; VF02 - temporary value
+; VF03 - temporary value
+; VF04 - temporary value
+; VF05 - temporary value
+; VF06 - temporary value
+; VF07 - temporary value
+; VF08 - temporary value
+; VF09 - (Near, Far, k/(xRes/2), k/(yRes/2)) where k=viewport_scale_x, should be 2048 but is 1900 because of clipper problem
+; VF10 - inverse viewport scale vector
+; VF11 - inverse viewport offset vector
+; VF12 - row 0, local to viewport transform
+; VF13 - row 1, local to viewport transform
+; VF14 - row 2, local to viewport transform
+; VF15 - row 3, local to viewport transform
+; VF26 - lightsource 2 colour (r,g,b,?)
+; VF17 - row 0, reflection map transform
+; VF18 - row 1, reflection map transform
+; VF19 - row 2, reflection map transform
+; VF20 - light vectors, x components
+; VF21 - light vectors, y components
+; VF22 - light vectors, z components
+; VF23 - ambient colour (r,g,b,?)
+; VF24 - lightsource 0 colour (r,g,b,?)
+; VF25 - lightsource 1 colour (r,g,b,?)
+; VF16 - texture projection scale vector
+; VF27 - texture projection offset vector
+; VF28 - saves the z-components of the view matrix during a z-push
+; VF29 - \
+; VF30 - - temporaries used in skinning code
+; VF31 - /
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+CULL=0x01	; per-triangle view culling
+CLIP=0x02	; full 3D clipping of triangles
+SHDW=0x04	; skinned=>cast shadow into texture; non-skinned=>render mesh with projected shadow texture on it
+COLR=0x08	; apply colour at vertices
+FOGE=0x10	; calculate per-vertex fog coefficient
+WIRE=0x20	; render skinned as wireframe (but doesn't render all edges)
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+; Make the very start and end of the file available to the linker, so the dma packet that
+; sends the code (using a dma ref tag) can be constructed.
+.global MPGStart
+.global MPGEnd
+
+; here's a list of all the entry points into the microcode so they're available to the engine
+.global	Setup
+.global	Jump
+.global Breakpoint
+.global	ParseInit
+.global	Parser
+.global	L_VF09
+.global	L_VF10
+.global	L_VF11
+.global	L_VF12
+.global	L_VF13
+.global	L_VF14
+.global	L_VF15
+.global	L_VF16
+.global	L_VF17
+.global	L_VF18
+.global	L_VF19
+.global	L_VF20
+.global	L_VF21
+.global	L_VF22
+.global	L_VF23
+.global	L_VF24
+.global	L_VF25
+.global	L_VF26
+.global	L_VF27
+.global	L_VF28
+.global	L_VF29
+.global	L_VF30
+.global	L_VF31
+.global	GSPrim
+.global Sprites
+.global SpriteCull
+.global ReformatXforms
+.global ShadowVolumeSkin
+
+; These entry points are currently not used, because the entry points are being generated in
+; the scene converter which doesn't have the linker information available for the microcode.
+; Instead there is a temporary jump table at the top of program memory, branching to each
+; routine via fixed known locations.
+.global Proj
+.global PTex
+.global Refl
+.global Line
+.global Skin
+
+; align to a 2^4=16 byte boundary, so it can be the target of a dma::ref
+.align	4
+
+; label so the engine knows where to start dma'ing the microcode from
+MPGStart:
+
+; The MPG directive (ended by .EndMPG at the bottom of the file) is the assembler mechanism
+; for constructing a vif packet using the MPG vifcode, which tells the vif to upload the
+; subsequent data as vu microcode. But it's cleverer than that, because (a) it will split
+; the data into multiple MPG vif packets if the maximum size for MPG is exceeded (2K), and
+; (b) all labels between the MPG and the .EndMPG will be reduced so that not only are they
+; relative to the start of the MPG block, but also act as if any extra MPG vifcodes inserted
+; into the data didn't really exist... as if the assembler output really contained just the
+; microcode and not the extra vifcodes, just like it will be when it reaches MicroMem1 (the
+; program memory of VU1).
+
+MPG 0, *
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; Jump table. (This can later be eliminated with a mechanism for supplying vu1 label
+; addresses to the scene converter.)
+
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								B			Breakpoint
+		NOP								NOP
+		NOP								B			ParseInit
+		NOP								NOP
+		NOP								B			Parser
+		NOP								NOP
+		NOP								B			L_VF09
+		NOP								NOP
+		NOP								B			L_VF10
+		NOP								NOP
+		NOP								B			L_VF11
+		NOP								NOP
+		NOP								B			L_VF12
+		NOP								NOP
+		NOP								B			L_VF13
+		NOP								NOP
+		NOP								B			L_VF14
+		NOP								NOP
+		NOP								B			L_VF15
+		NOP								NOP
+		NOP								B			L_VF16
+		NOP								NOP
+		NOP								B			L_VF17
+		NOP								NOP
+		NOP								B			L_VF18
+		NOP								NOP
+		NOP								B			L_VF19
+		NOP								NOP
+		NOP								B			L_VF20
+		NOP								NOP
+		NOP								B			L_VF21
+		NOP								NOP
+		NOP								B			L_VF22
+		NOP								NOP
+		NOP								B			L_VF23
+		NOP								NOP
+		NOP								B			L_VF24
+		NOP								NOP
+		NOP								B			L_VF25
+		NOP								NOP
+		NOP								B			L_VF26
+		NOP								NOP
+		NOP								B			L_VF27
+		NOP								NOP
+		NOP								B			L_VF28
+		NOP								NOP
+		NOP								B			L_VF29
+		NOP								NOP
+		NOP								B			L_VF30
+		NOP								NOP
+		NOP								B			L_VF31
+		NOP								NOP
+		NOP								B			GSPrim
+		NOP								NOP
+Proj:	NOP								B			Proj1
+		NOP								NOP
+PTex:	NOP								B			PTex1
+		NOP								NOP
+Refl:	NOP								B			Refl1
+		NOP								NOP
+Line:	NOP								B			Line1
+		NOP								NOP
+Skin:	NOP								B			Skin1
+		NOP								NOP
+Light:	NOP								B			Light1
+		NOP								IADDIU		VI10,VI00,0
+LightT:	NOP								B			Light1
+		NOP								IADDIU		VI10,VI00,1
+WibbleT:NOP								B			WibbleT1
+		NOP								NOP
+LWibT:	NOP								B			LWibT1
+		NOP								IADDIU		VI10,VI00,1
+AddZPush:NOP							B			ZPush
+		NOP								LOI			16
+SubZPush:NOP							B			RestoreZPush
+		NOP								NOP
+Setup:	NOP[E]							XTOP		VI02				; initialise input pointer and halt
+		NOP								NOP
+Jump:	NOP								B			JumpToIt
+		NOP								NOP
+SCAB:	NOP								B			ScreenAlignedBillboards
+		NOP								NOP
+LAB:	NOP								B			LongAxisBillboards
+		NOP								NOP
+SHAB:	NOP								B			ShortAxisBillboards
+		NOP								NOP
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+JumpToIt:	; set new value for data pointer
+
+		NOP								MTIR		VI02,VF01z
+		NOP								XTOP		VI01
+		NOP								IADD		VI02,VI02,VI01
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+Breakpoint:	; for debugging purposes
+
+		NOP[D]							B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+;-----------------------------------------------------------------------------------------------------------------------------
+;
+;
+;
+;	ÉÍÍÍÍÍÍÍÍÍÍÍÍ»
+;	º tag format º
+;	ÈÍÍÍÍÍÍÍÍÍÍÍÍ¼
+;
+;	This follows GIFtag format (EE User's Manual section 7.2.2), but with some added fields.
+;
+;
+;
+;	 31 30                   23 22                16 15 14                                         0
+;	ÚÄÄÂÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÂÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÂÄÄÂÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ¿
+;	³0 ³     NREG exponent     ³ NREG mantissa      ³EOP                   NLOOP                    ³
+;	ÀÄÄÁÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÁÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÁÄÄÁÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÙ
+;
+;
+;	 63       60 59 58 57                            47 46 45    43 42                            32
+;	ÚÄÄÄÄÄÄÄÄÄÄÄÂÄÄÄÄÄÂÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÂÄÄÂÄÄÄÄÄÄÄÄÂÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ¿
+;	³   NREG    ³ FLG ³              PRIM              ³PRE  FLAGS ³              ADDR              ³
+;	ÀÄÄÄÄÄÄÄÄÄÄÄÁÄÄÄÄÄÁÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÁÄÄÁÄÄÄÄÄÄÄÄÁÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÙ
+;
+;
+;	 95                                                       76 75       72 71       68 67       64
+;	ÚÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÂÄÄÄÄÄÄÄÄÄÄÄÂÄÄÄÄÄÄÄÄÄÄÄÂÄÄÄÄÄÄÄÄÄÄÄ¿
+;	³                                                     ...   ³  [REG2]   ³  [REG1]   ³   REG0    ³
+;	ÀÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÁÄÄÄÄÄÄÄÄÄÄÄÁÄÄÄÄÄÄÄÄÄÄÄÁÄÄÄÄÄÄÄÄÄÄÄÙ
+;
+;
+;	 127                                         112 111                                          96
+;	ÚÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÂÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ¿
+;	³                                               ³                      SIZE                     ³
+;	ÀÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÁÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÙ
+;
+;
+;
+; Added fields:
+;
+; bits 22-16:	the mantissa of ((float)NREG*powf(2,-23))
+; bits 23-30:	the exponent of ((float)NREG*powf(2,-23))
+; bit  31:		zero, the a sign bit for treating the x-component as a float
+;
+; bits 32-42:	ADDR, the vu1 code address for processing the current primitive
+; bits 43-45:	FLAGS, 43=unused, 44=u-clamp, 45=v-clamp
+;
+; bits 96-111:	SIZE=NREG*NLOOP
+;
+; bits 112-127:	unused
+;
+;-----------------------------------------------------------------------------------------------------------------------------
+; This is the main loop that parses the incoming packet data. Each iteration of PrimLoop will do this:
+; - set VI04 to NREG, the vertex step size
+; - set VI05 to the end address for the current prim
+; - set VI06 to NREG*NLOOP, the size of the current prim
+; - set VI15 to hold EOP in its sign bit
+; - jump the the address of the renderer that will process the prim
+; The two entry points are Parser, which maintains the previous value of the data pointer VI02,
+; and ParseInit, which first initialises VI02 to the value in VIF1_TOP.
+
+
+ParseInit:
+		NOP								XTOP		VI02				; initialise VI02
+
+Parser: NOP								LQI			VF01,(VI02++)		; get 1st tag
+		NOP								ISUBIU		VI13,VI02,1			; VI13 = start address of current packet
+		NOP								XITOP		VI14				; get run-time render flags from VIF1_ITOP
+
+PrimLoop:
+		ADDw.x		VF02,VF01,VF00w		MTIR		VI15,VF01x			; VI15=EOP:NLOOP, 'ADDw' is for extracting NREG
+		FTOI0.y		VF02,VF01			MTIR		VI01,VF01y			; VI01 = ADDR, renderer address
+		NOP								MTIR		VI06,VF01w			; VI06 = SIZE = NREG*NLOOP, size of prim (excl. tag)
+		NOP								IADD		VI05,VI02,VI06		; VI05 = end pointer for prim
+		NOP								JR			VI01				; jump to renderer
+		NOP								MTIR		VI04,VF02x			; VI04 = NREG (branch delay slot)
+
+NextPrim:
+		NOP								IBGEZ		VI15,PrimLoop		; loop if EOP==0
+		NOP								NOP
+
+KickPacket:
+
+		; kick and stop
+		NOP[E]							XGKICK		VI13				; kick the processed packet to the GS
+		NOP								ISUBIU		VI02,VI02,1			; undo last postincrement (VI02 points to next packet)
+
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; Process a VU1 prim
+; ------------------
+; by loading the designated floating point registers.
+; It loads registers consecutively, starting from any register (VF09 or higher) and ending on
+; any of VF11, VF15, VF19, VF23, VF27 or VF31. The decision to load in batches of 4 was because
+; one often wants to load matrices as contextual data, and also to save having to put a test
+; (plus the necessary delay slots) after each individual register load... it just means having
+; to sometimes pad out the VU1 context to a 4-register boundary.
+
+L_VF09:	NOP								LQI			VF09,(VI02++)		; entry point for loading VF09, etc
+L_VF10:	NOP								LQI			VF10,(VI02++)
+L_VF11:	NOP								LQI			VF11,(VI02++)
+
+		MULw.w		VF24,VF11,VF00w		DIV			Q,VF00w,VF10w
+		SUB.w		VF11,VF00,VF00		IBEQ		VI02,VI05,VUPrimEnd
+		MULq.w		VF23,VF00,Q			WAITQ							; VF23w = f0
+		
+L_VF12:	NOP								LQI			VF12,(VI02++)
+L_VF13:	NOP								LQI			VF13,(VI02++)
+L_VF14:	NOP								LQI			VF14,(VI02++)
+L_VF15:	NOP								LQI			VF15,(VI02++)
+
+		NOP								IADDIU		VI01,VI02,1
+		NOP								IBEQ		VI02,VI05,VUPrimEnd
+		NOP								NOP
+
+		NOP								IBEQ		VI01,VI05,VUPrimEnd
+L_VF16:	NOP								LQI			VF16,(VI02++)
+L_VF17:	NOP								LQI			VF17,(VI02++)
+L_VF18:	NOP								LQI			VF18,(VI02++)
+L_VF19:	NOP								LQI			VF19,(VI02++)
+
+		NOP								NOP
+		NOP								IBEQ		VI02,VI05,VUPrimEnd
+		NOP								NOP
+
+L_VF20:	NOP								LQI			VF20,(VI02++)
+L_VF21:	NOP								LQI			VF21,(VI02++)
+L_VF22:	NOP								LQI			VF22,(VI02++)
+L_VF23:	NOP								LQI.xyz		VF23,(VI02++)
+
+		NOP								NOP
+		NOP								IBEQ		VI02,VI05,VUPrimEnd
+		NOP								NOP
+
+L_VF24:	NOP								LQI.xyz		VF24,(VI02++)
+L_VF25:	NOP								LQI			VF25,(VI02++)
+L_VF26:	NOP								LQI			VF26,(VI02++)
+L_VF27:	NOP								LQI			VF27,(VI02++)
+
+		NOP								NOP
+		NOP								IBEQ		VI02,VI05,VUPrimEnd
+		NOP								NOP
+
+L_VF28:	NOP								LQI			VF28,(VI02++)
+L_VF29:	NOP								LQI			VF29,(VI02++)
+L_VF30:	NOP								LQI			VF30,(VI02++)
+L_VF31:	NOP								LQI			VF31,(VI02++)
+
+VUPrimEnd:
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; process a GS prim
+; -----------------
+; by simply stepping the data pointer over it.
+
+GSPrim:	NOP								LQ			VF01,0(VI05)		; prefetch next tag
+		NOP								ISUBIU		VI12,VI02,1			; save the current tag address (see clipping code)
+		NOP								B			NextPrim			; go back for next prim
+		NOP								IADDIU		VI02,VI05,1			; step data pointer past next tag
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+CullPrim:
+		NOP								ISUBIU		VI01,VI00,1
+		NOP								MFIR.z		VF01,VI01
+		NOP								SQ.z		VF01,-1(VI02)
+		NOP								IADD		VI02,VI02,VI06
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; zpush
+; -----
+; m_localToViewport[0][2] += m_localToViewport[0][3] * zPush * I / FogAlpha;
+; m_localToViewport[1][2] += m_localToViewport[1][3] * zPush * I / FogAlpha;
+; m_localToViewport[2][2] += m_localToViewport[2][3] * zPush * I / FogAlpha;
+; m_localToViewport[3][2] += m_localToViewport[3][3] * zPush * I / FogAlpha;
+; on entry, zPush is held in VF01w (from the tag)
+
+		; new version, frees up VF12-15
+		; still needs optimising
+
+ZPush:
+		MULi.w		VF02,VF10,I			NOP
+
+		SUB.w		VF28,VF00,VF00		NOP
+		ADDz.x		VF28,VF00,VF12z		NOP
+		ADDz.y		VF28,VF00,VF13z		NOP
+		ADDz.z		VF28,VF00,VF14z		NOP
+		ADDz.w		VF28,VF28,VF15z		NOP
+		
+		MULw.w		VF04,VF12,VF02w		MR32.z		VF02,VF01
+		MULw.w		VF05,VF13,VF02w		NOP
+		MULw.w		VF06,VF14,VF02w		NOP
+		MULw.w		VF07,VF15,VF02w		NOP
+		ADDA.z		ACC,VF00,VF12		NOP
+		MADDw.z		VF12,VF02,VF04		NOP
+		ADDA.z		ACC,VF00,VF13		NOP
+		MADDw.z		VF13,VF02,VF05		NOP
+		ADDA.z		ACC,VF00,VF14		LQI			VF01,(VI02++)
+		MADDw.z		VF14,VF02,VF06		NOP
+		ADDA.z		ACC,VF00,VF15		B			NextPrim
+		MADDw.z		VF15,VF02,VF07		NOP
+
+RestoreZPush:
+
+		ADDx.z		VF12,VF00,VF28x		NOP
+		ADDy.z		VF13,VF00,VF28y		NOP
+		ADDz.z		VF14,VF00,VF28z		NOP
+		ADDw.z		VF15,VF00,VF28w		NOP
+
+		NOP								LQI			VF01,(VI02++)
+		NOP								B			NextPrim
+		NOP								NOP
+		
+;-----------------------------------------------------------------------------------------------------------------------------
+; vertex projection
+; -----------------
+; just transforms and projects the vertex coords, used for non-textured meshes
+
+Proj1:
+		; first some hackery added in as a bit of an afterthought, to support single-sided and colouring of meshes
+
+		NOP								IADDIU		VI11,VI00,0x0800
+		NOP								IAND		VI01,VI01,VI11
+		NOP								ISUBIU		VI10,VI00,FOGE+1
+		NOP								IAND		VI14,VI14,VI10
+		NOP								IBNE		VI01,VI00,SingleSided
+		NOP								IADDIU		VI01,VI00,Label00
+
+Label00:NOP								IADDIU		VI01,VI00,COLR
+		NOP								IAND		VI01,VI14,VI01
+		NOP								ISUB		VI14,VI14,VI01
+		NOP								IBNE		VI01,VI00,ApplyColour
+		NOP								IADDIU		VI01,VI00,Label0
+		
+		; now branch to the appropriate rendering code
+
+Label0:	NOP								IBEQ		VI14,VI00,Proj2
+		NOP								IADDIU		VI01,VI00,CULL
+		
+		NOP								IADDIU		VI11,VI00,CLIP
+		NOP								IBEQ		VI14,VI01,Cull
+		NOP								IADDIU		VI01,VI00,Cull
+		
+		NOP								IBEQ		VI14,VI11,Clip
+		NOP								ISW.w		VI01,-1(VI02)
+		
+		NOP								B			CullPrim
+		NOP								NOP
+		
+	
+
+Proj2:
+
+		.if 1
+		
+		; fog version
+		
+		; f = min(f0+k/w,1) = f0+(1/w)(1-f0)min(w0,w)
+		; where k=w0(1-f0)
+		
+		NOP								LOI			0x45000FFF
+		MULi.w		VF25,VF00,I			NOP								; VF25w = 2^11 + 1 - 2^-12
+		SUBw.w		VF25,VF25,VF23w		NOP								; VF25w = 2^11 + 1-f0 - 2^-12
+		NOP								LOI			8
+		ADDi.w		VF26,VF25,I			NOP								; VF26w = VF25w + ADC
+		
+
+
+
+		.if 0
+
+		NOP								IADDIU		VI03,VI02,0
+		
+LoopP:
+		NOP								IADD		VI03,VI03,VI04
+		NOP								LQ.xyzw		VF01,-1(VI03)
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		ITOF4.xyz	VF02,VF01			MTIR		VI07,VF01w
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF02x		NOP
+		MADDAy		ACC,VF13,VF02y		NOP
+		MADDz		VF03,VF14,VF02z		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								DIV			Q,VF23w,VF03w
+		NOP								NOP
+		NOP								NOP
+		MINI.w		VF03,VF03,VF24w		NOP
+		NOP								IBLTZ		VI07,CullP
+		NOP								NOP
+		MULAw		ACC,VF00,VF25w		NOP
+		MADDq.xyzw	VF04,VF03,Q			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		FTOI4.xyz	VF04,VF04			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								IADD		VI02,VI02,VI04
+		NOP								SQ.xyzw		VF04,-1(VI02)
+		NOP								IBNE		VI02,VI05,LoopP
+		NOP								NOP
+
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+CullP:	MULAw		ACC,VF00,VF26w		NOP
+		MADDq.xyzw	VF04,VF03,Q			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		FTOI4.xyz	VF04,VF04			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								IADD		VI02,VI02,VI04
+		NOP								SQ.xyzw		VF04,-1(VI02)
+		NOP								IBNE		VI02,VI05,LoopP
+		NOP								NOP
+
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+		
+		.else
+		
+		NOP								IADD		VI03,VI02,VI04
+		ADDAx		ACC,VF15,VF00x		LQ.xyzw		VF01,-1(VI03)
+		ITOF4.xyz	VF02,VF01			MTIR		VI07,VF01w
+		MADDAx		ACC,VF12,VF02x		IADD		VI03,VI03,VI04
+		MADDAy		ACC,VF13,VF02y		LQ.xyzw		VF01,-1(VI03)
+		MADDz		VF04,VF14,VF02z		NOP
+		ITOF4.xyz	VF02,VF01			DIV			Q,VF23w,VF04w
+		MINI.w		VF04,VF04,VF24w		IADD		VI03,VI03,VI04
+		ADDAx		ACC,VF15,VF00x		IBLTZ		VI07,CullP0
+		MADDAx		ACC,VF12,VF02x		MTIR		VI07,VF01w
+		MADDAy		ACC,VF13,VF02y		LQ.xyzw		VF01,-1(VI03)
+		MADDz		VF03,VF14,VF02z		NOP
+		MULAw		ACC,VF00,VF25w		NOP
+		
+LoopP:	MADDq.xyzw	VF05,VF04,Q			MOVE.xyz	VF04,VF03
+		ITOF4.xyz	VF02,VF01			IADD		VI02,VI02,VI04
+		MINI.w		VF04,VF03,VF24w		DIV			Q,VF23w,VF03w
+		ADDAx		ACC,VF15,VF00x		IADD		VI03,VI03,VI04
+		FTOI4.xyz	VF05,VF05			IBLTZ		VI07,CullP
+		MADDAx		ACC,VF12,VF02x		MTIR		VI07,VF01w
+		MADDAy		ACC,VF13,VF02y		LQ.xyzw		VF01,-1(VI03)
+		MADDz		VF03,VF14,VF02z		IBNE		VI02,VI05,LoopP
+		MULAw		ACC,VF00,VF25w		SQ.xyzw		VF05,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+CullP0:	MADDAy		ACC,VF13,VF02y		LQ.xyzw		VF01,-1(VI03)
+		MADDz		VF03,VF14,VF02z		B			LoopP
+		MULAw		ACC,VF00,VF26w		NOP
+
+CullP:	MADDAy		ACC,VF13,VF02y		LQ.xyzw		VF01,-1(VI03)
+		MADDz		VF03,VF14,VF02z		IBNE		VI02,VI05,LoopP
+		MULAw		ACC,VF00,VF26w		SQ.xyzw		VF05,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+
+		.endif
+
+
+
+
+		.if 0
+		
+		; unoptimised version
+		
+		NOP								IADDIU		VI03,VI02,0			; source ptr = dest ptr
+
+LoopP:
+		NOP								IADD		VI03,VI03,VI04		; step source ptr
+		NOP								LQ.xyz		VF01,-1(VI03)		; get vertex coords
+		ITOF4.xyz	VF01,VF01			NOP								; vertex coords to float
+		ADDAx		ACC,VF15,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF12,VF01x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF01y		NOP								; row 1 view transform
+		MADDz		VF02,VF14,VF01z		NOP								; row 2 view transform
+		NOP								DIV			Q,VF00w,VF02w		; calc 1/w
+		NOP								WAITQ
+		MULq.xyz	VF03,VF02,Q			NOP								; homogeneous divide
+		NOP								IADD		VI02,VI02,VI04		; step dest ptr
+		NOP								SQ.xyz		VF03,-1(VI02)		; store screen coords
+		NOP								IBNE		VI02,VI05,LoopP		; loop
+		NOP								NOP
+		
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+		.endif
+		.else
+		.if 1
+		
+		; fairly optimised version
+		; 7 cycles per vertex
+		
+		; loop prologue
+		NOP								IADD		VI03,VI02,VI04									; init/step source ptr
+		ADDAx		ACC,VF15,VF00x		LQ.xyz		VF01,-1(VI03)		; row 3 view transform		; get 1st vertex
+		ITOF4.xyz	VF02,VF01			IADD		VI03,VI03,VI04		; 1st vertex to float		; step source ptr
+		MADDAx		ACC,VF12,VF02x		LQ.xyz		VF01,-1(VI03)		; row 0 view transform		; get 2nd vertex
+		MADDAy		ACC,VF13,VF02y		IADD		VI03,VI03,VI04		; row 1 view transform		; step source ptr
+		MADDz		VF04,VF14,VF02z		NOP								; row 2 view transform
+		ITOF4.xyz	VF02,VF01			LQ.xyz		VF01,-1(VI03)		; 2nd vertex to float		; get 3rd vertex
+		ADDAx		ACC,VF15,VF00x		DIV			Q,VF00w,VF04w		; row 3 view transform		; calc 1/w
+		MADDAx		ACC,VF12,VF02x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF02y		NOP                             ; row 1 view transform
+		MADDz		VF03,VF14,VF02z		NOP                             ; row 2 view transform
+		ITOF4.xyz	VF02,VF01			NOP								; 3rd vertex to float
+
+		; projection loop		
+LoopP:	NOP								IADD		VI03,VI03,VI04									; step source ptr
+		ADDAx		ACC,VF15,VF00x		LQ.xyz		VF01,-1(VI03)		; row 3 view transform		; get vertex coords
+		MULq.xyz	VF05,VF04,Q			DIV			Q,VF00w,VF03w		; homogeneous div (xyz)/w	; calc 1/w
+		MADDAx		ACC,VF12,VF02x		IADD		VI02,VI02,VI04		; row 0 view transform		; step destination ptr
+		MADDAy		ACC,VF13,VF02y		MOVE.xyz	VF04,VF03			; row 1 view transform		; advance vertex queue
+		MADDz		VF03,VF14,VF02z		IBNE		VI02,VI05,LoopP		; row 2 view transform		; loop
+		ITOF4.xyz	VF02,VF01			SQ.xyz		VF05,-1(VI02)		; vertex coord to float		; store screen coords
+		
+		NOP								B			NextPrim										; go back for next prim
+		NOP								LQI			VF01,(VI02++)									; prefetch next tag
+
+		.else
+		
+		; very optimised version
+		; 6 cycles per vertex, but uses a lot of code space
+		
+		; loop prologue
+		NOP								IADD		VI01,VI02,VI04
+		NOP								IADD		VI03,VI01,VI04
+		NOP								LQ.xyz		VF01,-1(VI03)									; get vertex 1
+		NOP								LQ.xyz		VF05,-1(VI01)									; get vertex 0
+		ITOF4.xyz	VF02,VF01			IADD		VI01,VI03,VI04		; vertex 1 to float
+		ITOF4.xyz	VF06,VF05			IADD		VI03,VI01,VI04		; vertex 0 to float
+		ADDAx		ACC,VF15,VF00x		LQ.xyz		VF01,-1(VI03)									; get vertex 3
+		MADDAx		ACC,VF12,VF02x		LQ.xyz		VF05,-1(VI01)									; get vertex 2
+		MADDAy		ACC,VF13,VF02y		IADD		VI03,VI03,VI04
+		MADDz		VF02,VF14,VF02z		IADDIU		VI01,VI00,1
+		ADDAx		ACC,VF15,VF00x		IAND		VI07,VI15,VI01		; test for NLOOP odd
+		MADDAx		ACC,VF12,VF06x		NOP
+		MADDAy		ACC,VF13,VF06y		NOP
+		MADDz		VF07,VF14,VF06z		ERCPR		P,VF02w
+		ITOF4.xyz	VF01,VF01			NOP								; vertex 3 to float
+		ITOF4.xyz	VF06,VF05			LQ.xyz		VF05,-1(VI03)		; vertex 2 to float			; get vertex 4
+		ADDAx		ACC,VF15,VF00x		DIV			Q,VF00w,VF07w
+		MADDAx		ACC,VF12,VF01x		NOP
+		MADDAy		ACC,VF13,VF01y		IADD		VI03,VI03,VI04
+		MADDz		VF03,VF14,VF01z		IBEQ		VI07,VI00,LoopP
+		ADDAx		ACC,VF15,VF00x		NOP
+		NOP								ISUB		VI05,VI05,VI04		; finish 1 vertex early if NLOOP odd
+	
+LoopP:	MADDAx		ACC,VF12,VF06x		LQ.xyz		VF01,-1(VI03)		; row 0 vertex transform B	; get vertex A
+		MADDAy		ACC,VF13,VF06y		IADD		VI03,VI03,VI04		; row 1 vertex transform B	; step source ptr
+		MULq.xyz	VF04,VF07,Q			ERCPR		P,VF03w				; homogeneous div (xyz)/wB'	; calculate 1/wA'
+		MADDz		VF07,VF14,VF06z		MFP.w		VF02,P				; row 2 vertex transform B	; get 1/wA
+		ITOF4.xyz	VF01,VF01			IADD		VI02,VI02,VI04		; vertex A to float			; step destination ptr
+		ITOF4.xyz	VF06,VF05			LQ.xyz		VF05,-1(VI03)		; vertex B' to float		; get vertex B
+		ADDAx		ACC,VF15,VF00x		SQ.xyz		VF04,-1(VI02)		; row 3 vertex transform A	; store screen coords B'
+
+		MULw.xyz	VF04,VF02,VF02w		DIV			Q,VF00w,VF07w		; homogeneous div (xyz)/wA	; calc 1/wB
+		MADDAx		ACC,VF12,VF01x		IADD		VI02,VI02,VI04		; row 0 vertex transform A	; step destination ptr
+		MADDAy		ACC,VF13,VF01y		IADD		VI03,VI03,VI04		; row 1 vertex transform A	; step source ptr
+		MADDz		VF02,VF14,VF01z		IBEQ		VI02,VI05,QuitP		; row 2 vertex transform A	; continue or quit
+		ADDAx		ACC,VF15,VF00x		SQ.xyz		VF04,-1(VI02)		; row 3 vertex transform B'	; store screen coords A
+
+		MADDAx		ACC,VF12,VF06x		LQ.xyz		VF01,-1(VI03)		; row 0 vertex transform B'	; get vertex A'
+		MADDAy		ACC,VF13,VF06y		IADD		VI03,VI03,VI04		; row 1 vertex transform B' ; step source ptr
+		MULq.xyz	VF04,VF07,Q			ERCPR		P,VF02w				; homogeneous div (xyz)/wB	; calc 1/wA
+		MADDz		VF07,VF14,VF06z		MFP.w		VF03,P				; row 2 vertex transform B'	; get 1/wA'
+		ITOF4.xyz	VF01,VF01			IADD		VI02,VI02,VI04		; vertex A' to float		; step destination ptr
+		ITOF4.xyz	VF06,VF05			LQ.xyz		VF05,-1(VI03)		; vertex B to float			; get vertex B'
+		ADDAx		ACC,VF15,VF00x		SQ.xyz		VF04,-1(VI02)		; row 3 vertex transform A'	; store screen coords B
+
+		MULw.xyz	VF04,VF03,VF03w		DIV			Q,VF00w,VF07w		; homogeneous div (xyz)/wA'	; calc 1/wB'
+		MADDAx		ACC,VF12,VF01x		IADD		VI02,VI02,VI04		; row 0 vertex transform A'	; step destination ptr
+		MADDAy		ACC,VF13,VF01y		IADD		VI03,VI03,VI04		; row 1 vertex transform A'	; step source ptr
+		MADDz		VF03,VF14,VF01z		IBNE		VI02,VI05,LoopP		; row 2 vertex transform A'	; loop or quit
+		ADDAx		ACC,VF15,VF00x		SQ.xyz		VF04,-1(VI02)		; row 3 vertex transform B	; store screen coords A'
+
+QuitP:	NOP								IBEQ		VI07,VI00,EndP									; finish if NLOOP was even
+		NOP								NOP
+		MULq.xyz	VF04,VF07,Q			IADD		VI02,VI02,VI04		; homogeneous div (xyz)/wB	; step source ptr
+		NOP								SQ.xyz		VF04,-1(VI02)									; store screen coords B
+
+EndP:	NOP								B			NextPrim										; back for next prim
+		NOP								LQI			VF01,(VI02++)									; prefetch next tag
+
+		.endif
+		.endif
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; triangle culling
+; ----------------
+; the per-triangle culling version of Proj
+
+Cull:
+
+
+		.if 1
+		
+		; fog version
+		
+		NOP								LOI			0x45000FFF
+		MULi.w		VF25,VF00,I			NOP								; VF25w = 2^11 + 1 - 2^-12
+		SUBw.w		VF25,VF25,VF23w		NOP								; VF25w = 2^11 + 1-f0 - 2^-12
+		
+		NOP								IADDIU		VI10,VI00,0x4000
+		NOP								IADDIU		VI10,VI10,0x4000
+
+
+		.if 0
+		
+		NOP								IADDIU		VI03,VI02,0
+
+LoopK:	NOP								IADD		VI03,VI03,VI04
+		NOP								LQ.xyzw		VF01,-1(VI03)
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								NOP
+		ITOF4.xyz	VF02,VF01			MTIR		VI07,VF01w
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF02x		NOP
+		MADDAy		ACC,VF13,VF02y		NOP
+		MADDz		VF03,VF14,VF02z		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MULA		ACC,VF10,VF03		DIV			Q,VF23w,VF03w
+		MADDw		VF04,VF11,VF03w		NOP
+		MINI.w		VF03,VF03,VF24		NOP
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF04xyz,VF04w		NOP
+		MULAw		ACC,VF00,VF25w		NOP
+		MADDq.xyzw	VF05,VF03,Q			NOP
+		NOP								NOP
+		NOP								FCAND		VI01,0x03FFFF
+		NOP								IBNE		VI01,VI00,CullK
+		FTOI4.xyz	VF06,VF05			MTIR		VI01,VF05w
+		NOP								IOR			VI01,VI01,VI07
+		NOP								MFIR.w		VF06,VI01
+		NOP								NOP
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopK
+		NOP								SQ.xyzw		VF06,-1(VI02)
+
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+CullK:	NOP								IOR			VI01,VI01,VI10
+		NOP								MFIR.w		VF06,VI01
+		NOP								NOP
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopK
+		NOP								SQ.xyzw		VF06,-1(VI02)
+
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+
+		.else
+		
+		NOP								IADDIU		VI03,VI02,0
+		
+		
+		NOP								IADD		VI03,VI03,VI04
+		NOP								LQ			VF01,-1(VI03)
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		ITOF4.xyz	VF01,VF01			NOP
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF01x		NOP
+		MADDAy		ACC,VF13,VF01y		MTIR		VI06,VF01w
+		MADDz		VF02,VF14,VF01z		NOP
+		NOP								NOP
+		
+		NOP								IADD		VI03,VI03,VI04
+		NOP								LQ			VF01,-1(VI03)
+		ADDx.xyz	VF04,VF02,VF00x		DIV			Q,VF23w,VF02w
+		MULA		ACC,VF10,VF02		NOP
+		MADDw		VF03,VF11,VF02w		NOP
+		ITOF4.xyz	VF01,VF01			NOP
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF01x		IADDIU		VI07,VI06,0
+		MADDAy		ACC,VF13,VF01y		MTIR		VI06,VF01w
+		MADDz		VF02,VF14,VF01z		NOP
+		CLIPw.xyz	VF03xyz,VF03w		NOP
+		
+LoopK:	MULAw		ACC,VF00,VF25w		IADD		VI03,VI03,VI04
+		MADDq		VF05,VF04,Q			LQ			VF01,-1(VI03)
+		ADDx.xyz	VF04,VF02,VF00x		DIV			Q,VF23w,VF02w
+		MULA		ACC,VF10,VF02		IADD		VI02,VI02,VI04
+		MADDw		VF03,VF11,VF02w		FCAND		VI01,0x03FFFF
+		ITOF4.xyz	VF01,VF01			IBNE		VI01,VI00,CullK
+		MINIw.w		VF04,VF02,VF24w		MTIR		VI01,VF05w
+		FTOI4.xyz	VF06,VF05			IOR			VI01,VI01,VI07
+		ADDAx		ACC,VF15,VF00x		MFIR.w		VF06,VI01
+		MADDAx		ACC,VF12,VF01x		IADDIU		VI07,VI06,0
+		MADDAy		ACC,VF13,VF01y		MTIR		VI06,VF01w
+		MADDz		VF02,VF14,VF01z		IBNE		VI02,VI05,LoopK
+		CLIPw.xyz	VF03xyz,VF03w		SQ			VF06,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+CullK:	FTOI4.xyz	VF06,VF05			IOR			VI01,VI01,VI10
+		ADDAx		ACC,VF15,VF00x		MFIR.w		VF06,VI01
+		MADDAx		ACC,VF12,VF01x		IADDIU		VI07,VI06,0
+		MADDAy		ACC,VF13,VF01y		MTIR		VI06,VF01w
+		MADDz		VF02,VF14,VF01z		IBNE		VI02,VI05,LoopK
+		CLIPw.xyz	VF03xyz,VF03w		SQ			VF06,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+		
+		
+		
+		.endif
+
+
+		.else
+
+		.if 0
+		; unoptimised
+		
+		NOP								IADDIU		VI03,VI02,0			; source ptr = dest ptr
+		FTOI15.w	VF05,VF00			NOP								; set VF05w=0x8000 (for ADC bit)
+
+LoopK:	NOP								IADD		VI03,VI03,VI04		; step source ptr
+		NOP								LQ.xyz		VF01,-1(VI03)		; get vertex coords
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		ITOF4.xyz	VF02,VF01			NOP								; vertex coords to float
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF12,VF02x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF02y		NOP								; row 1 view transform
+		MADDz		VF03,VF14,VF02z		NOP								; row 2 view transform
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MULA		ACC,VF10,VF03		DIV			Q,VF00w,VF03w		; inv viewport scale	; calc 1/w
+		MADDw		VF06,VF11,VF03w		NOP								; inv viewport offset
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF06xyz,VF06w		NOP								; generate outcodes
+		NOP								NOP
+		MULq.xyz	VF05,VF03,Q			NOP								; homogeneous divide
+		NOP								IADD		VI02,VI02,VI04		; step dest ptr
+		NOP								FCAND		VI01,0x03FFFF		; test last 3 outcodes
+		NOP								IBNE		VI01,VI00,CullK		; cull if all out
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopK		; loop
+		NOP								SQ.xyz		VF05,-1(VI02)		; store screen coords
+		
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+CullK:	NOP								IBNE		VI02,VI05,LoopK		; loop
+		NOP								SQ			VF05,-1(VI02)		; store screen coords
+		
+		.else
+		; optimised
+		
+		FTOI15.w	VF05,VF00			IADD		VI03,VI02,VI04
+		ADDAx		ACC,VF15,VF00x		LQ.xyz		VF01,-1(VI03)
+		ITOF4.xyz	VF02,VF01			IADD		VI03,VI03,VI04
+		MADDAx		ACC,VF12,VF02x		LQ.xyz		VF01,-1(VI03)
+		MADDAy		ACC,VF13,VF02y		IADD		VI03,VI03,VI04
+		MADDz		VF04,VF14,VF02z		NOP
+		ITOF4.xyz	VF02,VF01			LQ.xyz		VF01,-1(VI03)
+		MULA		ACC,VF10,VF04		DIV			Q,VF00w,VF04w
+		MADDw		VF06,VF11,VF04w		NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF02x		NOP
+		MADDAy		ACC,VF13,VF02y		NOP
+		MADDz		VF03,VF14,VF02z		NOP
+		
+LoopK:	CLIPw.xyz	VF06xyz,VF06w		IADD		VI03,VI03,VI04
+		MULq.xyz	VF05,VF04,Q			IADD		VI02,VI02,VI04
+		ITOF4.xyz	VF02,VF01			LQ.xyz		VF01,-1(VI03)
+		MULA		ACC,VF10,VF03		DIV			Q,VF00w,VF03w
+		MADDw		VF06,VF11,VF03w		FCAND		VI01,0x03FFFF
+		ADDAx		ACC,VF15,VF00x		IBNE		VI01,VI00,CullK
+		MADDAx		ACC,VF12,VF02x		MOVE.xyz	VF04,VF03
+		MADDAy		ACC,VF13,VF02y		IBNE		VI02,VI05,LoopK
+		MADDz		VF03,VF14,VF02z		SQ.xyz		VF05,-1(VI02)
+		
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+CullK:	MADDAy		ACC,VF13,VF02y		IBNE		VI02,VI05,LoopK
+		MADDz		VF03,VF14,VF02z		SQ			VF05,-1(VI02)
+		
+		.endif
+		
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+		
+		.endif
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; vertex projection with perspective texturing
+; --------------------------------------------
+; transforms and projects vertex coords, and applies perspective to texture coords
+
+
+
+		
+PTex1:
+
+		; first some hackery added in as a bit of an afterthought, to support single-sided and colouring of meshes
+		; and switch between VU1-fogging and standard version of rendering code
+		
+		NOP								IADDIU		VI10,VI00,0x0800
+		NOP								IAND		VI10,VI01,VI10
+		NOP								IADDIU		VI11,VI00,0x3000
+		NOP								IAND		VI11,VI01,VI11
+		NOP								IBNE		VI10,VI00,SingleSided
+		NOP								IADDIU		VI01,VI00,Label1
+Label1:
+		NOP								IADDIU		VI01,VI00,COLR
+		NOP								IAND		VI01,VI14,VI01
+		NOP								ISUB		VI14,VI14,VI01
+		NOP								IBNE		VI01,VI00,ApplyColour
+		NOP								IADDIU		VI01,VI00,Label2
+Label2:
+
+		; test for fog enable
+		NOP								MFIR.y		VF02,VI11
+		NOP								IADDIU		VI01,VI00,FOGE
+		NOP								IAND		VI01,VI14,VI01
+		NOP								ISUB		VI14,VI14,VI01		; clear FOGE flag
+		ITOF12.y	VF02,VF02			IBNE		VI01,VI00,PTexFog
+		NOP								IADDIU		VI01,VI00,3
+		NOP								LOI			0x302E4000
+		ADDAi.y		ACC,VF00,I			LOI			0x2A800000
+		MADDi.y		VF01,VF02,I			IBEQ		VI04,VI01,FGE0		; keep uv-clamp flags
+		NOP								LOI			0x4F800000
+		MULi.y		VF01,VF01,I			NOP
+FGE0:	NOP								SQ.y		VF01,-1(VI02)		; clear FGE bit
+
+
+		NOP								IBEQ		VI14,VI00,PTex2
+		NOP								IADDIU		VI01,VI00,CULL
+		
+		NOP								IADDIU		VI11,VI00,CLIP
+		NOP								IBEQ		VI14,VI01,CullPTex
+		NOP								IADDIU		VI01,VI00,CullPTex
+		
+		NOP								IBEQ		VI14,VI11,Clip
+		NOP								ISW.w		VI01,-1(VI02)
+		
+		NOP								B			Shadow
+		NOP								NOP
+
+
+PTexFog:
+		
+		NOP								IBEQ		VI14,VI00,PTex2F
+		NOP								IADDIU		VI01,VI00,CULL
+		
+		NOP								IADDIU		VI11,VI00,CLIP
+		NOP								IBEQ		VI14,VI01,CullPTexF
+		NOP								IADDIU		VI01,VI00,CullPTexF
+		
+		NOP								IBEQ		VI14,VI11,Clip
+		NOP								ISW.w		VI01,-1(VI02)
+		
+		NOP								B			Shadow
+		NOP								NOP
+		
+	
+
+		
+PTex2F:
+		; fog version
+		
+		NOP								LOI			0x45000FFF
+		MULi.w		VF25,VF00,I			NOP								; VF25w = 2^11 + 1 - 2^-12
+		SUBw.w		VF25,VF25,VF23w		NOP								; VF25w = 2^11 + 1-f0 - 2^-12
+		NOP								LOI			8
+		ADDi.w		VF26,VF25,I			NOP								; VF26w = VF25w + ADC
+
+
+
+		.if 0
+		
+		; unoptimised
+		
+		NOP								IADDIU		VI03,VI02,0
+		NOP								MR32.z		VF07,VF00
+
+		
+LoopPTF:NOP								LQ.xy		VF06,0(VI03)
+		NOP								IADD		VI03,VI03,VI04
+		NOP								LQ.xyzw		VF01,-1(VI03)
+		NOP								NOP
+		NOP								NOP
+		ITOF12.xy	VF07,VF06			NOP
+		ITOF4.xyz	VF02,VF01			MTIR		VI07,VF01w
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF02x		NOP
+		MADDAy		ACC,VF13,VF02y		NOP
+		MADDz		VF03,VF14,VF02z		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								DIV			Q,VF23w,VF03w
+		MINI.w		VF03,VF03,VF24		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								IBLTZ		VI07,PTCullF
+		NOP								NOP
+		MULAw		ACC,VF00,VF25w		NOP
+		MULq.xyz	VF08,VF07,Q			NOP
+		MADDq		VF04,VF03,Q			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								SQ.xyz		VF08,0(VI02)
+		FTOI4.xyz	VF04,VF04			NOP
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopPTF
+		NOP								SQ.xyzw		VF04,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+PTCullF:MULAw		ACC,VF00,VF26w		NOP
+		MULq.xyz	VF08,VF07,Q			NOP
+		MADDq		VF04,VF03,Q			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								SQ.xyz		VF08,0(VI02)
+		FTOI4.xyz	VF04,VF04			NOP
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopPTF
+		NOP								SQ.xyzw		VF04,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+		
+		.else
+		
+		; optimised
+		
+		NOP								IADD		VI03,VI02,VI04
+		ADDAx		ACC,VF15,VF00x		LQ			VF01,-1(VI03)
+		ITOF4.xyz	VF01,VF01			LQ.xy		VF07,0(VI02)
+		MADDAx		ACC,VF12,VF01x		NOP
+		MADDAy		ACC,VF13,VF01y		LQ.xy		VF05,0(VI03)
+		MADDz		VF03,VF14,VF01z		IADD		VI03,VI03,VI04
+		MINI.w		VF03,VF03,VF24		DIV			Q,VF23w,VF03w
+		ITOF12.xy	VF07,VF07			MTIR		VI07,VF01w
+		ITOF12.xy	VF06,VF05			LQ			VF01,-1(VI03)
+		ITOF4.xyz	VF01,VF01			NOP
+		ADDAx		ACC,VF15,VF00x		MR32.z		VF07,VF00
+		
+LoopPTF:MADDAx		ACC,VF12,VF01x		LQ.xy		VF05,0(VI03)
+		MADDAy		ACC,VF13,VF01y		IADD		VI03,VI03,VI04
+		MULq		VF04,VF03,Q			IBLTZ		VI07,PTCullF
+		MADDz		VF03,VF14,VF01z		MTIR		VI07,VF01w
+		MULq.xyz	VF08,VF07,Q			LQ			VF01,-1(VI03)
+		ADDx.xy		VF07,VF06,VF00x		IADDIU		VI01,VI02,0
+		FTOI4.xyz	VF04,VF04			IADD		VI02,VI02,VI04
+		ADD.w		VF04,VF04,VF25		DIV			Q,VF23w,VF03w
+		ITOF4.xyz	VF01,VF01			SQ.xyz		VF08,0(VI01)
+		MINI.w		VF03,VF03,VF24		NOP
+		ITOF12.xy	VF06,VF05			IBNE		VI02,VI05,LoopPTF
+		ADDAx		ACC,VF15,VF00x		SQ			VF04,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+PTCullF:MULq.xyz	VF08,VF07,Q			LQ			VF01,-1(VI03)
+		ADDx.xy		VF07,VF06,VF00x		IADDIU		VI01,VI02,0
+		FTOI4.xyz	VF04,VF04			IADD		VI02,VI02,VI04
+		ADD.w		VF04,VF04,VF26		DIV			Q,VF23w,VF03w
+		ITOF4.xyz	VF01,VF01			SQ.xyz		VF08,0(VI01)
+		MINI.w		VF03,VF03,VF24		NOP
+		ITOF12.xy	VF06,VF05			IBNE		VI02,VI05,LoopPTF
+		ADDAx		ACC,VF15,VF00x		SQ			VF04,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+		
+		
+		
+		.endif
+		
+		
+		
+		
+		; non-fogged version
+		
+PTex2:
+
+
+		.if 0
+		; unoptimised version
+		
+		NOP								IADDIU		VI03,VI02,0			; source ptr = dest ptr
+		NOP								MR32.z		VF04,VF00			; set 1 in (s,t,1)
+
+LoopPT:	NOP								LQ.xy		VF04,0(VI03)		; get texture coords
+		NOP								IADD		VI03,VI03,VI04		; step source ptr
+		NOP								LQ.xyz		VF01,-1(VI03)		; get vertex coords
+		NOP								NOP
+		NOP								NOP
+		ITOF12.xy	VF04,VF04			NOP								; texture coords to float
+		ITOF4.xyz	VF01,VF01			NOP								; vertex coords to float
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF12,VF01x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF01y		NOP								; row 1 view transform		
+		MADDz		VF02,VF14,VF01z		NOP								; row 2 view transform
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								DIV			Q,VF23w,VF02w		; calc 1/w
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MULq.xyz	VF05,VF04,Q			NOP								; homogeneous div (st1)/w
+		MULq.xyz	VF03,VF02,Q			NOP								; homogeneous div (xyz)/w
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		FTOI4.xyz	VF03,VF03			NOP
+		NOP								NOP
+		NOP								SQ.xyz		VF05,0(VI02)		; store texture coords
+		NOP								IADD		VI02,VI02,VI04		; step dest ptr
+		NOP								SQ.xyz		VF03,-1(VI02)		; store screen coords
+		NOP								IBNE		VI02,VI05,LoopPT	; loop
+		NOP								NOP
+		
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+		
+		.else
+		
+		; optimised
+		
+		NOP								IADD		VI03,VI02,VI04
+		ADDAx		ACC,VF15,VF00x		LQ.xyz		VF01,-1(VI03)
+		ITOF4.xyz	VF01,VF01			LQ.xy		VF05,0(VI02)
+		MADDAx		ACC,VF12,VF01x		LQ.xy		VF06,0(VI03)
+		MADDAy		ACC,VF13,VF01y		IADD		VI03,VI03,VI04
+		MADDz		VF03,VF14,VF01z		LQ.xyz		VF01,-1(VI03)
+		ITOF12.xy	VF07,VF05			NOP
+		ITOF4.xyz	VF01,VF01			MR32.z		VF07,VF00
+		ADDAx		ACC,VF15,VF00x		DIV			Q,VF23w,VF03w
+		MADDAx		ACC,VF12,VF01x		LQ.xy		VF05,0(VI03)
+		MADDAy		ACC,VF13,VF01y		IADD		VI03,VI03,VI04
+		MADDz		VF02,VF14,VF01z		LQ.xyz		VF01,-1(VI03)
+		MULq.xyz	VF08,VF07,Q			WAITQ
+		MULq.xyz	VF04,VF03,Q			NOP
+		
+LoopPT:	ITOF12.xy	VF07,VF06			MOVE.xy		VF06,VF05
+		ITOF4.xyz	VF01,VF01			DIV			Q,VF23w,VF02w
+		ADDx.xyz	VF03,VF02,VF00x		SQ.xyz		VF08,0(VI02)
+		FTOI4.xyz	VF04,VF04			IADD		VI02,VI02,VI04
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF01x		LQ.xy		VF05,0(VI03)
+		MADDAy		ACC,VF13,VF01y		IADD		VI03,VI03,VI04
+		MADDz		VF02,VF14,VF01z		LQ.xyz		VF01,-1(VI03)
+		MULq.xyz	VF08,VF07,Q			IBNE		VI02,VI05,LoopPT
+		MULq.xyz	VF04,VF03,Q			SQ.xyz		VF04,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+		
+		.endif
+		
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; triangle culling and perspective texturing
+
+
+CullPTexF:
+
+		; fog version
+		
+		NOP								LOI			0x45000FFF
+		MULi.w		VF25,VF00,I			NOP								; VF25w = 2^11 + 1 - 2^-12
+		SUBw.w		VF25,VF25,VF23w		NOP								; VF25w = 2^11 + 1-f0 - 2^-12
+		
+		NOP								IADDIU		VI10,VI00,0x4000
+		NOP								IADDIU		VI10,VI10,0x4000
+		
+		
+		.if 0
+		; unoptimised
+		
+		NOP								IADDIU		VI03,VI02,0
+		NOP								MR32.z		VF07,VF00
+
+		
+LoopKPTF:
+		NOP								LQ.xy		VF07,0(VI03)
+		NOP								IADD		VI03,VI03,VI04
+		NOP								LQ.xyzw		VF01,-1(VI03)
+		NOP								NOP
+		NOP								NOP
+		ITOF12.xy	VF07,VF07			NOP
+		ITOF4.xyz	VF02,VF01			MTIR		VI07,VF01w
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF02x		NOP
+		MADDAy		ACC,VF13,VF02y		NOP
+		MADDz		VF03,VF14,VF02z		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MULA		ACC,VF10,VF03		DIV			Q,VF23w,VF03w
+		MADDw		VF04,VF11,VF03w		NOP
+		MINI.w		VF03,VF03,VF24		NOP
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF04xyz,VF04w		NOP
+		MULAw		ACC,VF00,VF25w		NOP
+		MULq.xyz	VF08,VF07,Q			NOP
+		MADDq		VF05,VF03,Q			NOP
+		NOP								NOP
+		NOP								FCAND		VI01,0x03FFFF
+		NOP								IBNE		VI01,VI00,CullKPTF
+		FTOI4.xyz	VF06,VF05			SQ.xyz		VF08,0(VI02)
+		NOP								MTIR		VI11,VF05w
+		NOP								IOR			VI11,VI11,VI07
+		NOP								MFIR.w		VF06,VI11
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopKPTF
+		NOP								SQ.xyzw		VF06,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+CullKPTF:
+		NOP								MTIR		VI11,VF05w
+		NOP								IOR			VI11,VI11,VI10
+		NOP								MFIR.w		VF06,VI11
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopKPTF
+		NOP								SQ.xyzw		VF06,-1(VI02)
+
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+
+		.else
+		; optimised
+
+		NOP								IADD		VI03,VI02,VI04
+		ADDAx		ACC,VF15,VF00x		LQ			VF04,-1(VI03)
+		ITOF4.xyz	VF04,VF04			LQ.xy		VF07,0(VI02)
+		MADDAx		ACC,VF12,VF04x		MTIR		VI07,VF04w
+		MADDAy		ACC,VF13,VF04y		LQ.xy		VF06,0(VI03)
+		MADDz		VF04,VF14,VF04z		IADD		VI03,VI03,VI04
+		ITOF12.xy	VF07,VF07			LQ			VF01,-1(VI03)
+		MULA		ACC,VF10,VF04		DIV			Q,VF23w,VF04w
+		MADDw		VF03,VF11,VF04w		MR32.z		VF07,VF00
+		ITOF4.xyz	VF01,VF01			NOP
+		MINI.w		VF04,VF04,VF24		NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF01x		NOP
+		MADDAy		ACC,VF13,VF01y		NOP
+		MADDz		VF02,VF14,VF01z		NOP
+		CLIPw.xyz	VF03xyz,VF03w		NOP
+		
+LoopKPTF:
+		MULq.xyz	VF08,VF07,Q			MTIR		VI06,VF01w
+		ITOF12.xy	VF07,VF06			LQ.xy		VF06,0(VI03)
+		MULAw		ACC,VF00,VF25w		IADD		VI03,VI03,VI04
+		MADDq		VF05,VF04,Q			LQ			VF01,-1(VI03)
+		ADDx.xyz	VF04,VF02,VF00x		FCAND		VI01,0x03FFFF
+		MULA		ACC,VF10,VF02		DIV			Q,VF23w,VF02w
+		MADDw		VF03,VF11,VF02w		SQ.xyz		VF08,0(VI02)
+		ITOF4.xyz	VF01,VF01			IBNE		VI01,VI00,CullKPTF
+		MINI.w		VF04,VF02,VF24		MTIR		VI11,VF05w
+		FTOI4.xyz	VF05,VF05			IOR			VI11,VI11,VI07
+		ADDAx		ACC,VF15,VF00x		MFIR.w		VF05,VI11
+		MADDAx		ACC,VF12,VF01x		IADD		VI02,VI02,VI04
+		MADDAy		ACC,VF13,VF01y		IADDIU		VI07,VI06,0
+		MADDz		VF02,VF14,VF01z		IBNE		VI02,VI05,LoopKPTF
+		CLIPw.xyz	VF03xyz,VF03w		SQ.xyzw		VF05,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+CullKPTF:
+		FTOI4.xyz	VF05,VF05			IOR			VI11,VI11,VI10
+		ADDAx		ACC,VF15,VF00x		MFIR.w		VF05,VI11
+		MADDAx		ACC,VF12,VF01x		IADD		VI02,VI02,VI04
+		MADDAy		ACC,VF13,VF01y		IADDIU		VI07,VI06,0
+		MADDz		VF02,VF14,VF01z		IBNE		VI02,VI05,LoopKPTF
+		CLIPw.xyz	VF03xyz,VF03w		SQ.xyzw		VF05,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+		
+		.endif
+		
+		
+
+
+		
+		; non-fogged version
+
+CullPTex:
+
+		.if 0
+		; unoptimised
+		
+		NOP								IADDIU		VI03,VI02,0			; source ptr = dest ptr
+		FTOI15.w	VF05,VF00			NOP								; set VF05w=0x8000 (for ADC bit)
+		NOP								MR32.z		VF07,VF00			; set 1 in (s,t,1)
+
+LoopKPT:NOP								LQ.xy		VF07,0(VI03)		; get tex coords
+		NOP								IADD		VI03,VI03,VI04		; step source ptr
+		NOP								LQ.xyz		VF01,-1(VI03)		; get vertex coords
+		NOP								NOP
+		NOP								NOP
+		ITOF12.xy	VF07,VF07			NOP								; tex coords to float
+		ITOF4.xyz	VF02,VF01			NOP								; vertex coords to float
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF12,VF02x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF02y		NOP								; row 1 view transform
+		MADDz		VF03,VF14,VF02z		NOP								; row 2 view transform
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MULA		ACC,VF10,VF03		DIV			Q,VF23w,VF03w		; inv viewport scale	; calc 1/w
+		MADDw		VF06,VF11,VF03w		NOP								; inv viewport offset
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF06xyz,VF06w		NOP								; generate outcodes
+		NOP								NOP
+		MULq.xyz	VF08,VF07,Q			NOP								; homogeneous divide (st1)/w
+		MULq.xyz	VF05,VF03,Q			NOP								; homogeneous divide (xyz)/w
+		NOP								NOP
+		NOP								FCAND		VI01,0x03FFFF		; test last 3 outcodes
+		NOP								SQ.xyz		VF08,0(VI02)
+		FTOI4.xyz	VF05,VF05			IADD		VI02,VI02,VI04		; step dest ptr
+		NOP								IBNE		VI01,VI00,CullKPT	; cull if all out
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopKPT	; loop
+		NOP								SQ.xyz		VF05,-1(VI02)		; store screen coords
+		
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+CullKPT:NOP								IBNE		VI02,VI05,LoopKPT	; loop
+		NOP								SQ			VF05,-1(VI02)		; store screen coords
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+		.else
+		
+		; optimised
+		
+		NOP								IADD		VI03,VI02,VI04
+		ADDAx		ACC,VF15,VF00x		LQ.xyz		VF01,-1(VI03)
+		ITOF4.xyz	VF01,VF01			LQ.xy		VF05,0(VI02)
+		MADDAx		ACC,VF12,VF01x		LQ.xy		VF06,0(VI03)
+		MADDAy		ACC,VF13,VF01y		IADD		VI03,VI03,VI04
+		MADDz		VF03,VF14,VF01z		LQ.xyz		VF01,-1(VI03)
+		ITOF12.xy	VF07,VF05			NOP
+		MULA		ACC,VF10,VF03		NOP
+		MADDw		VF02,VF11,VF03w		DIV			Q,VF23w,VF03w
+		ITOF4.xyz	VF01,VF01			MR32.z		VF07,VF00
+		ADDAx		ACC,VF15,VF00x		ISUBIU		VI01,VI00,1
+		CLIPw.xyz	VF02xyz,VF02w		MFIR.w		VF04,VI01
+		MADDAx		ACC,VF12,VF01x		NOP
+		MADDAy		ACC,VF13,VF01y		NOP
+		
+LoopKPT:MADDz		VF02,VF14,VF01z		LQ.xy		VF05,0(VI03)
+		MULq.xyz	VF08,VF07,Q			IADD		VI03,VI03,VI04
+		MULq.xyz	VF04,VF03,Q			LQ.xyz		VF01,-1(VI03)
+		ITOF12.xy	VF07,VF06			FCAND		VI01,0x03FFFF
+		MULA		ACC,VF10,VF02		DIV			Q,VF23w,VF02w
+		MADDw		VF03,VF11,VF02w		MOVE.xy		VF06,VF05
+		ITOF4.xyz	VF01,VF01			SQ.xyz		VF08,0(VI02)
+		FTOI4.xyz	VF04,VF04			IADD		VI02,VI02,VI04
+		ADDAx		ACC,VF15,VF00x		IBNE		VI01,VI00,CullKPT
+		CLIPw.xyz	VF03xyz,VF03w		MOVE.xyz	VF03,VF02
+		MADDAx		ACC,VF12,VF01x		IBNE		VI02,VI05,LoopKPT
+		MADDAy		ACC,VF13,VF01y		SQ.xyz		VF04,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+CullKPT:MADDAx		ACC,VF12,VF01x		IBNE		VI02,VI05,LoopKPT
+		MADDAy		ACC,VF13,VF01y		SQ			VF04,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+		.endif
+		
+;-----------------------------------------------------------------------------------------------------------------------------
+
+WibbleT1:
+
+		.if 0
+		; unoptimised version
+		
+		NOP								IADDIU		VI03,VI02,0
+		
+LoopW:	NOP								LQ.xy		VF01,0(VI03)
+		NOP								IADD		VI03,VI03,VI04
+		NOP								NOP
+		NOP								NOP
+		ITOF12.xy	VF02,VF01			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		ADD.xy		VF03,VF02,VF27		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		FTOI12.xy	VF04,VF03			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								SQ.xy		VF04,0(VI02)
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopW
+		NOP								NOP
+		
+		.else
+		; optimised version
+		
+		
+		NOP								LQ.xy		VF04,0(VI02)
+		ITOF12.xy	VF04,VF04			IADD		VI03,VI02,VI04
+		ADD.xy		VF04,VF04,VF27		LQ.xy		VF03,0(VI03)
+		ITOF12.xy	VF03,VF03			IADD		VI03,VI03,VI04
+		FTOI12.xy	VF04,VF04			LQ.xy		VF02,0(VI03)
+		ADD.xy		VF03,VF03,VF27		IADD		VI03,VI03,VI04
+		ITOF12.xy	VF02,VF02			ISUB		VI05,VI05,VI04
+		
+LoopW:	NOP								LQ.xy		VF01,0(VI03)
+		NOP								SQ.xy		VF04,0(VI02)
+		FTOI12.xy	VF04,VF03			IADD		VI03,VI03,VI04
+		ADD.xy		VF03,VF02,VF27      IBNE		VI02,VI05,LoopW
+		ITOF12.xy	VF02,VF01			IADD		VI02,VI02,VI04
+		
+		NOP								IADD		VI05,VI05,VI04
+		
+		.endif
+		
+		NOP								B			PTex1
+		NOP								ISUB		VI02,VI02,VI06
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+LWibT1:
+
+		; optimised version
+		
+		NOP								LQ.xy		VF04,0(VI02)
+		ITOF12.xy	VF04,VF04			IADD		VI03,VI02,VI04
+		ADD.xy		VF04,VF04,VF27		LQ.xy		VF03,0(VI03)
+		ITOF12.xy	VF03,VF03			IADD		VI03,VI03,VI04
+		FTOI12.xy	VF04,VF04			LQ.xy		VF02,0(VI03)
+		ADD.xy		VF03,VF03,VF27		IADD		VI03,VI03,VI04
+		ITOF12.xy	VF02,VF02			ISUB		VI05,VI05,VI04
+		
+LoopLW:	NOP								LQ.xy		VF01,0(VI03)
+		NOP								SQ.xy		VF04,0(VI02)
+		FTOI12.xy	VF04,VF03			IADD		VI03,VI03,VI04
+		ADD.xy		VF03,VF02,VF27      IBNE		VI02,VI05,LoopLW
+		ITOF12.xy	VF02,VF01			IADD		VI02,VI02,VI04
+		
+		NOP								IADD		VI05,VI05,VI04
+		
+		NOP								B			Light1
+		NOP								ISUB		VI02,VI02,VI06
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; reflection mapping
+
+Refl1:
+
+		NOP								IADDIU		VI11,VI00,0x0800
+		NOP								IAND		VI01,VI01,VI11
+		NOP								NOP
+		NOP								IBNE		VI01,VI00,SingleSided
+		NOP								IADDIU		VI01,VI00,LabelR0
+
+LabelR0:
+		NOP								IADDIU		VI01,VI00,COLR
+		NOP								IAND		VI01,VI14,VI01
+		NOP								ISUB		VI14,VI14,VI01
+		NOP								IBNE		VI01,VI00,ApplyColour
+		NOP								IADDIU		VI01,VI00,LabelR1
+
+LabelR1:
+		NOP								IADDIU		VI01,VI00,CLIP
+		NOP								IAND		VI01,VI14,VI01
+		NOP								NOP
+		NOP								IBNE		VI01,VI00,ReflClip
+		NOP								NOP
+
+
+		.if 0
+		; unoptimised
+
+		NOP								IADDIU		VI03,VI02,0
+		NOP								MR32.z		VF04,VF00
+		NOP								LOI			0.5
+
+LoopR: 	NOP								LQ.xyz		VF05,0(VI03)		; get normal
+		NOP								IADD		VI03,VI03,VI04		; step source pointer
+		NOP								LQ.xyz		VF01,-1(VI03)		; get vertex
+		NOP								NOP
+		ITOF15.xyz	VF05,VF05			NOP								; VF05 = n (unit, in model space)
+		NOP								NOP
+		ITOF4.xyz	VF02,VF01			NOP
+		
+		; compute 0.5*(nx+vx/vz+1, ny+vy/vz+1)
+		MULAx.xyz	ACC,VF17,VF02x		NOP								; transform v
+		MADDAy.xyz	ACC,VF18,VF02y		NOP
+		MADDz.xyz	VF02,VF19,VF02z		NOP
+		MULAx.xy	ACC,VF17,VF05x		NOP								; transform n
+		MADDAy.xy	ACC,VF18,VF05y		NOP
+		MADDz.xy	VF03,VF19,VF05z		NOP
+		NOP								DIV			Q,VF00w,VF02z		; calc 1/vz'
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		ADDAi.xy	ACC,VF03,I			NOP
+		MSUBq.xy	VF04,VF02,Q			NOP
+
+		NOP								SQ.xyz		VF04,0(VI02)
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopR
+		NOP								NOP
+
+		NOP								B			Proj1
+		NOP								ISUB		VI02,VI02,VI06
+
+		.else
+		; optimised
+		NOP								LQ.xyz		VF02,2(VI02)
+		NOP								LQ.xyz		VF04,0(VI02)
+		ITOF4.xyz	VF02,VF02			MR32.z		VF03,VF00
+		ITOF15.xyz	VF05,VF04			LOI			0.5
+		MULAx.xyz	ACC,VF17,VF02x		LQ.xyz		VF01,5(VI02)
+		MADDAy.xyz	ACC,VF18,VF02y		LQ.xyz		VF04,3(VI02)
+		MADDz.xyz	VF02,VF19,VF02z		NOP
+		MULAx.xy	ACC,VF17,VF05x		NOP
+		ITOF4.xyz	VF01,VF01			DIV			Q,VF00w,VF02z
+		MADDAy.xy	ACC,VF18,VF05y		NOP
+		MADDz.xy    VF27,VF19,VF05z		NOP
+		ITOF15.xyz	VF05,VF04			NOP
+		
+LoopR:	MULAx.xyz	ACC,VF17,VF01x		MOVE.xy		VF03,VF02
+		MADDAy.xyz	ACC,VF18,VF01y		NOP
+		MADDz.xyz	VF02,VF19,VF01z		LQ.xyz		VF01,8(VI02)
+		ADDAi.xy	ACC,VF27,I			LQ.xyz		VF04,6(VI02)
+		MSUBq.xy	VF03,VF03,Q			IADD		VI02,VI02,VI04
+		MULAx.xy	ACC,VF17,VF05x		NOP
+		ITOF4.xyz	VF01,VF01			DIV			Q,VF00w,VF02z
+		MADDAy.xy	ACC,VF18,VF05y		NOP
+		MADDz.xy    VF27,VF19,VF05z		IBNE		VI02,VI05,LoopR
+		ITOF15.xyz	VF05,VF04			SQ.xyz		VF03,-3(VI02)
+		
+		NOP								B			Proj2
+		NOP								ISUB		VI02,VI02,VI06
+
+		.endif
+		
+		
+		
+		
+ReflClip:
+
+		.if 0
+		; unoptimised
+		
+		NOP								IADDIU		VI03,VI02,0
+		NOP								LOI			0.5
+
+
+LoopRC:	NOP								LQ.xyz		VF04,0(VI03)		; get normal
+		NOP								IADD		VI03,VI03,VI04		; step source pointer
+		NOP								LQ.xyz		VF01,-1(VI03)		; get vertex
+		NOP								NOP
+		ITOF15.xyz	VF04,VF04			NOP								; VF01 = n (unit, in model space)
+		NOP								NOP
+		ITOF4.xyz	VF01,VF01			NOP
+		
+		; compute ((nx'+0.5)*vz'-vx', (ny'+0.5)*vz'-vy', vz', 1/vz')
+		MULAx.xyz	ACC,VF17,VF01x		NOP								; transform v
+		MADDAy.xyz	ACC,VF18,VF01y		NOP
+		MADDz.xyz	VF02,VF19,VF01z		NOP
+		ADDAi.xy	ACC,VF00,I			NOP
+		MADDAx.xy	ACC,VF17,VF04x		NOP								; transform n
+		MADDAy.xy	ACC,VF18,VF04y		NOP
+		MADDz.xy	VF03,VF19,VF04z		NOP
+		NOP								DIV			Q,VF00w,VF02z
+		SUBA.xy		ACC,VF00,VF02		MOVE.z		VF04,VF02
+		MADDz.xy	VF04,VF03,VF02z		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MULq.w		VF04,VF00,Q			NOP
+		
+		NOP								SQ			VF04,0(VI02)
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopRC
+		NOP								NOP
+
+		NOP								ISUB		VI02,VI02,VI06
+
+		NOP								IADDIU		VI01,VI00,ReflPostClip
+		
+		NOP								B			Clip
+		NOP								ISW.w		VI01,-1(VI02)
+		
+		.else
+		; optimised
+		
+		NOP								LQ.xyz		VF02,2(VI02)
+		NOP								LQ.xyz		VF03,0(VI02)
+		ITOF4.xyz	VF02,VF02			LOI			0.5
+		ITOF15.xyz	VF04,VF03			NOP
+		MULAx.xyz	ACC,VF17,VF02x		LQ.xyz		VF03,3(VI02)
+		MADDAy.xyz	ACC,VF18,VF02y		LQ.xyz		VF01,5(VI02)
+		MADDz.xyz	VF02,VF19,VF02z		NOP
+		ADDAi.xy	ACC,VF00,I			NOP
+		MADDAx.xy	ACC,VF17,VF04x		NOP
+		MADDAy.xy	ACC,VF18,VF04y		NOP
+		
+LoopRC:	MADDz.xy	VF05,VF19,VF04z		DIV			Q,VF00w,VF02z
+		ITOF4.xyz	VF01,VF01			IADD		VI02,VI02,VI04
+		ITOF15.xyz	VF04,VF03			NOP
+		SUBA.xy		ACC,VF00,VF02		MOVE.z		VF05,VF02
+		MADDz.xy	VF05,VF05,VF02z		NOP
+		MULAx.xyz	ACC,VF17,VF01x		NOP
+		MADDAy.xyz	ACC,VF18,VF01y		NOP
+		MULq.w		VF05,VF00,Q			LQ.xyz		VF03,3(VI02)
+		MADDz.xyz	VF02,VF19,VF01z		LQ.xyz		VF01,5(VI02)
+		ADDAi.xy	ACC,VF00,I			NOP
+		MADDAx.xy	ACC,VF17,VF04x		IBNE		VI02,VI05,LoopRC
+		MADDAy.xy	ACC,VF18,VF04y		SQ			VF05,-3(VI02)
+		
+		NOP								ISUB		VI02,VI02,VI06
+
+		NOP								IADDIU		VI01,VI00,ReflPostClip
+		
+		NOP								B			Clip
+		NOP								ISW.w		VI01,-1(VI02)
+		
+		
+		.endif
+
+
+
+
+ReflPostClip:
+
+		.if 1
+		
+		; fog version
+
+		
+		
+		NOP								LOI			0x45000FFF
+		MULi.w		VF25,VF00,I			NOP								; VF25w = 2^11 + 1 - 2^-12
+		SUBw.w		VF25,VF25,VF23w		NOP								; VF25w = 2^11 + 1-f0 - 2^-12
+		
+		NOP								IADDIU		VI10,VI00,0x4000
+		NOP								IADDIU		VI10,VI10,0x4000
+		
+		
+		.if 0
+		; unoptimised
+		
+		NOP								IADDIU		VI03,VI02,0
+
+		
+LoopRPC:NOP								LQ			VF07,0(VI03)
+		NOP								IADD		VI03,VI03,VI04
+		NOP								LQ			VF01,-1(VI03)
+		NOP								NOP
+		NOP								NOP
+		MULw.xyz	VF08,VF07,VF07w		NOP								; homogeneous divide (str)/r
+		ITOF4.xyz	VF02,VF01			MTIR		VI07,VF01w
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF02x		NOP
+		MADDAy		ACC,VF13,VF02y		NOP
+		MADDz		VF03,VF14,VF02z		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MULA		ACC,VF10,VF03		DIV			Q,VF23w,VF03w
+		MADDw		VF04,VF11,VF03w		NOP
+		MINI.w		VF03,VF03,VF24		NOP
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF04xyz,VF04w		NOP
+		MULAw		ACC,VF00,VF25w		NOP
+		MADDq		VF05,VF03,Q			NOP
+		NOP								NOP
+		NOP								FCAND		VI01,0x03FFFF
+		NOP								IBNE		VI01,VI00,CullRPC
+		FTOI4.xyz	VF06,VF05			SQ.xyz		VF08,0(VI02)
+		NOP								MTIR		VI11,VF05w
+		NOP								IOR			VI11,VI11,VI07
+		NOP								MFIR.w		VF06,VI11
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopRPC
+		NOP								SQ.xyzw		VF06,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+CullRPC:NOP								MTIR		VI11,VF05w
+		NOP								IOR			VI11,VI11,VI10
+		NOP								MFIR.w		VF06,VI11
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopRPC
+		NOP								SQ.xyzw		VF06,-1(VI02)
+
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+		.else
+		; optimised
+		
+		NOP								IADD		VI03,VI02,VI04
+		ADDAx		ACC,VF15,VF00x		LQ			VF04,-1(VI03)
+		ITOF4.xyz	VF04,VF04			LQ			VF07,0(VI02)
+		MADDAx		ACC,VF12,VF04x		MTIR		VI07,VF04w
+		MADDAy		ACC,VF13,VF04y		LQ			VF06,0(VI03)
+		MADDz		VF04,VF14,VF04z		IADD		VI03,VI03,VI04
+		ADDx		VF07,VF07,VF00x		LQ			VF01,-1(VI03)
+		MULA		ACC,VF10,VF04		DIV			Q,VF23w,VF04w
+		MADDw		VF03,VF11,VF04w		NOP
+		ITOF4.xyz	VF01,VF01			NOP
+		MINI.w		VF04,VF04,VF24		NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF01x		NOP
+		MADDAy		ACC,VF13,VF01y		NOP
+		MADDz		VF02,VF14,VF01z		NOP
+		CLIPw.xyz	VF03xyz,VF03w		NOP
+		
+LoopRPC:MULw.xyz	VF08,VF07,VF07w		MTIR		VI06,VF01w
+		ADDx		VF07,VF06,VF00x		LQ			VF06,0(VI03)
+		MULAw		ACC,VF00,VF25w		IADD		VI03,VI03,VI04
+		MADDq		VF05,VF04,Q			LQ			VF01,-1(VI03)
+		ADDx.xyz	VF04,VF02,VF00x		FCAND		VI01,0x03FFFF
+		MULA		ACC,VF10,VF02		DIV			Q,VF23w,VF02w
+		MADDw		VF03,VF11,VF02w		SQ.xyz		VF08,0(VI02)
+		ITOF4.xyz	VF01,VF01			IBNE		VI01,VI00,CullRPC
+		MINI.w		VF04,VF02,VF24		MTIR		VI11,VF05w
+		FTOI4.xyz	VF05,VF05			IOR			VI11,VI11,VI07
+		ADDAx		ACC,VF15,VF00x		MFIR.w		VF05,VI11
+		MADDAx		ACC,VF12,VF01x		IADD		VI02,VI02,VI04
+		MADDAy		ACC,VF13,VF01y		IADDIU		VI07,VI06,0
+		MADDz		VF02,VF14,VF01z		IBNE		VI02,VI05,LoopRPC
+		CLIPw.xyz	VF03xyz,VF03w		SQ.xyzw		VF05,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+CullRPC:FTOI4.xyz	VF05,VF05			IOR			VI11,VI11,VI10
+		ADDAx		ACC,VF15,VF00x		MFIR.w		VF05,VI11
+		MADDAx		ACC,VF12,VF01x		IADD		VI02,VI02,VI04
+		MADDAy		ACC,VF13,VF01y		IADDIU		VI07,VI06,0
+		MADDz		VF02,VF14,VF01z		IBNE		VI02,VI05,LoopRPC
+		CLIPw.xyz	VF03xyz,VF03w		SQ.xyzw		VF05,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+		
+		
+		.endif
+		
+		
+		
+		.else
+		
+		; original version
+
+
+		.if 1
+		; unoptimised
+
+		FTOI15.w	VF05,VF00			NOP								; set VF05w=0x8000 (for ADC bit)
+
+LoopRPC:NOP								LQ			VF07,0(VI02)		; get tex coords
+		NOP								LQ.xyz		VF01,2(VI02)		; get vertex coords
+		NOP								NOP
+		NOP								NOP
+		MULw.xyz	VF08,VF07,VF07w		NOP								; homogeneous divide (str)/r
+		ITOF4.xyz	VF02,VF01			NOP								; vertex coords to float
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF12,VF02x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF02y		NOP								; row 1 view transform
+		MADDz		VF03,VF14,VF02z		NOP								; row 2 view transform
+		NOP								SQ.xyz		VF08,0(VI02)
+		NOP								IADD		VI02,VI02,VI04		; step dest ptr
+		NOP								NOP
+		MULA		ACC,VF10,VF03		DIV			Q,VF00w,VF03w		; inv viewport scale	; calc 1/w
+		MADDw		VF06,VF11,VF03w		NOP								; inv viewport offset
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF06xyz,VF06w		NOP								; generate outcodes
+		NOP								NOP
+		MULq.xyz	VF05,VF03,Q			NOP								; homogeneous divide (xyz)/w
+		NOP								NOP
+		NOP								FCAND		VI01,0x03FFFF		; test last 3 outcodes
+		NOP								IBNE		VI01,VI00,CullRPC	; cull if one was out
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopRPC	; loop
+		NOP								SQ.xyz		VF05,-1(VI02)		; store screen coords
+		
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+CullRPC:NOP								IBNE		VI02,VI05,LoopRPC	; loop
+		NOP								SQ			VF05,-1(VI02)		; store screen coords
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+		.else
+		; optimised
+		
+		ADDAx		ACC,VF15,VF00x		LQ.xyz		VF01,2(VI02)
+		ITOF4.xyz	VF02,VF01			LQ.xyz		VF01,5(VI02)
+		MADDAx		ACC,VF12,VF02x		LQ			VF07,0(VI02)
+		MADDAy		ACC,VF13,VF02y		IADDIU		VI01,VI00,0x4000
+		MADDz		VF03,VF14,VF02z		IADDIU		VI01,VI01,0x4000
+		MULw.xyz	VF08,VF07,VF07w		MFIR.w		VF05,VI01
+		ITOF4.xyz	VF02,VF01			LQ			VF07,3(VI02)
+		MULA		ACC,VF10,VF03		NOP
+		MADDw		VF06,VF11,VF03w		DIV			Q,VF00w,VF03w
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF02x		NOP
+		
+LoopRPC:MADDAy		ACC,VF13,VF02y		MOVE.xyz	VF04,VF03
+		CLIPw.xyz	VF06xyz,VF06w		LQ.xyz		VF01,8(VI02)
+		MADDz		VF03,VF14,VF02z		IADD		VI02,VI02,VI04
+		MULw.xyz	VF08,VF07,VF07w		SQ.xyz		VF08,-3(VI02)
+		MULq.xyz	VF05,VF04,Q			LQ			VF07,3(VI02)
+		ITOF4.xyz	VF02,VF01			FCAND		VI01,0x03FFFF
+		MULA		ACC,VF10,VF03		IBNE		VI01,VI00,CullRPC
+		MADDw		VF06,VF11,VF03w		DIV			Q,VF00w,VF03w
+		ADDAx		ACC,VF15,VF00x		IBNE		VI02,VI05,LoopRPC
+		MADDAx		ACC,VF12,VF02x		SQ.xyz		VF05,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+CullRPC:ADDAx		ACC,VF15,VF00x		IBNE		VI02,VI05,LoopRPC
+		MADDAx		ACC,VF12,VF02x		SQ			VF05,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+		.endif
+		
+		.endif
+
+
+
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; lighting (2 diffuse + ambient)
+
+Light1:
+		.if 0
+		; unoptimised version
+		
+		NOP								IADDIU		VI03,VI02,0
+		
+LoopL:	NOP								IADD		VI03,VI03,VI04
+		NOP								LQ.xyz		VF01,-3(VI03)
+		NOP								LQ.xyz		VF08,-2(VI03)
+		NOP								NOP
+		NOP								NOP
+		ITOF15.xyz	VF02,VF01			NOP
+		ITOF0.xyz	VF08,VF08			NOP
+		NOP								NOP
+		NOP								NOP
+		MULAx.xyz	ACC,VF20,VF02x		NOP
+		MADDAy.xyz	ACC,VF21,VF02y		NOP
+		MADDz.xyz	VF03,VF22,VF02z		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MAXx.xyz	VF04,VF03,VF00x		NOP
+		NOP								NOP
+		NOP								NOP
+		ADDAx.xyz	ACC,VF23,VF00x		NOP
+		MADDAx.xyz	ACC,VF24,VF04x		NOP
+		MADDAy.xyz	ACC,VF25,VF04y		NOP
+		MADDz.xyz	VF05,VF26,VF04z		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MUL.xyz		VF05,VF05,VF08		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								LOI			255
+		MINIi.xyz	VF06,VF05,I			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		FTOI0.xyz	VF07,VF06			NOP
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopL
+		NOP								SQ.xyz		VF07,-2(VI02)
+		
+
+		.else
+		; optimised version
+		
+		NOP								IADD		VI03,VI02,VI04
+		NOP								LQ.xyz		VF02,-3(VI03)
+		ITOF15.xyz	VF02,VF02			LQ.xyz		VF06,-2(VI03)
+		MULAx.xyz	ACC,VF20,VF02x		IADD		VI03,VI03,VI04
+		MADDAy.xyz	ACC,VF21,VF02y		LQ.xyz		VF01,-3(VI03)
+		MADDz.xyz	VF02,VF22,VF02z		LQ.xyz		VF05,-2(VI03)
+		ITOF0.xyz	VF06,VF06			NOP
+		MAXx.xyz	VF02,VF02,VF00x		NOP
+		ADDAx.xyz	ACC,VF23,VF00x		NOP
+		ITOF15.xyz	VF01,VF01			NOP
+		MADDAx.xyz	ACC,VF24,VF02x		NOP
+		MADDAy.xyz	ACC,VF25,VF02y		NOP
+		MADDz.xyz	VF03,VF26,VF02z		NOP
+		MULAx.xyz	ACC,VF20,VF01x		NOP
+		MADDAy.xyz	ACC,VF21,VF01y		NOP
+		MADDz.xyz	VF02,VF22,VF01z		IADD		VI03,VI03,VI04
+		MUL.xyz		VF03,VF03,VF06		LQ.xyz		VF01,-3(VI03)
+		ITOF0.xyz	VF06,VF05			LQ.xyz		VF05,-2(VI03)
+		MAXx.xyz	VF02,VF02,VF00x		NOP
+		ADDAx.xyz	ACC,VF23,VF00x      LOI			255
+		
+LoopL:	ITOF15.xyz	VF01,VF01			NOP
+		MINIi.xyz	VF04,VF03,I			NOP
+		MADDAx.xyz	ACC,VF24,VF02x		NOP
+		MADDAy.xyz	ACC,VF25,VF02y		NOP
+		MADDz.xyz	VF03,VF26,VF02z		NOP
+		MULAx.xyz	ACC,VF20,VF01x		NOP
+		MADDAy.xyz	ACC,VF21,VF01y		NOP
+		MADDz.xyz	VF02,VF22,VF01z		IADD		VI03,VI03,VI04
+		FTOI0.xyz	VF04,VF04			IADD		VI02,VI02,VI04
+		MUL.xyz		VF03,VF03,VF06		LQ.xyz		VF01,-3(VI03)
+		ITOF0.xyz	VF06,VF05			LQ.xyz		VF05,-2(VI03)
+		MAXx.xyz	VF02,VF02,VF00x		IBNE		VI02,VI05,LoopL
+		ADDAx.xyz	ACC,VF23,VF00x		SQ.xyz		VF04,-2(VI02)
+		
+		.endif
+		
+		NOP								IADDIU		VI11,VI00,0x3000
+		NOP								IAND		VI11,VI01,VI11
+		
+		NOP								ISUBIU		VI08,VI00,COLR+1
+		NOP								IAND		VI14,VI14,VI08
+		
+		NOP								IBNE		VI10,VI00,Label2
+		NOP								ISUB		VI02,VI05,VI06
+		NOP								B			Label0
+		NOP								NOP
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; applying material colour
+
+ApplyColour:
+
+		.if 0
+		; unoptimised version
+		
+		NOP								IADDIU		VI03,VI02,0
+		
+LoopAC:	NOP								IADD		VI03,VI03,VI04
+		NOP								LQ.xyz		VF01,-2(VI03)
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		ITOF0.xyz	VF02,VF01			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MUL.xyz		VF03,VF02,VF16		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								LOI			255
+		MINIi.xyz	VF04,VF03,I			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		FTOI0.xyz	VF05,VF04			NOP
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopAC
+		NOP								SQ.xyz		VF05,-2(VI02)
+		
+		.else
+		; optimised version
+		
+		NOP								IADD		VI03,VI02,VI04
+		NOP								LQ.xyz		VF01,-2(VI03)
+		ITOF0.xyz	VF02,VF01			IADD		VI03,VI03,VI04
+		MUL.xyz		VF03,VF02,VF16		LQ.xyz		VF01,-2(VI03)
+		ITOF0.xyz	VF02,VF01			LOI			255
+		MINIi.xyz	VF04,VF03,I			IADD		VI03,VI03,VI04
+		MUL.xyz		VF03,VF02,VF16		LQ.xyz		VF01,-2(VI03)
+		ITOF0.xyz	VF02,VF01			IADD		VI03,VI03,VI04
+		FTOI0.xyz	VF05,VF04			LQ.xyz		VF01,-2(VI03)
+		
+LoopAC:	MINIi.xyz	VF04,VF03,I			IADD		VI03,VI03,VI04
+		MUL.xyz		VF03,VF02,VF16		IADD		VI02,VI02,VI04
+		ITOF0.xyz	VF02,VF01			LQ.xyz		VF01,-2(VI03)
+		NOP								IBNE		VI02,VI05,LoopAC
+		FTOI0.xyz	VF05,VF04			SQ.xyz		VF05,-2(VI02)
+		
+		.endif
+
+		NOP								JR			VI01
+		NOP								ISUB		VI02,VI02,VI06
+		
+;-----------------------------------------------------------------------------------------------------------------------------
+
+		
+SingleSided:
+
+		.if 0
+
+		NOP								IADDIU		VI03,VI02,0
+		ADDw.x		VF08,VF00,VF00w		NOP
+		FTOI15.w	VF08,VF00			NOP
+		
+Loop_SS:OPMULA.xyz	ACC,VF02,VF03		NOP
+		OPMSUB.xyz	VF04,VF03,VF02		NOP
+		ADDx		VF02,VF03,VF00x		NOP
+		NOP								IADD		VI03,VI03,VI04
+		NOP								LQ			VF01,-1(VI03)
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		ITOF4.xyz	VF03,VF01			MTIR		VI10,VF01w
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MUL.xyz		VF05,VF04,VF03		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		ADDAy.x		ACC,VF05,VF05y		NOP
+		MADDz.x		VF00,VF08,VF05z		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								IADD		VI02,VI02,VI04
+		NOP								FMEQ		VI10,VI10
+		NOP								IBEQ		VI10,VI00,Cull_SS
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,Loop_SS
+		NOP								NOP
+		
+		NOP								JR			VI01
+		NOP								ISUB		VI02,VI02,VI06
+		
+Cull_SS:NOP								IBNE		VI02,VI05,Loop_SS
+		NOP								SQ.w		VF08,-1(VI02)
+		
+		NOP								JR			VI01
+		NOP								ISUB		VI02,VI02,VI06
+		
+		.else
+		
+		ADDw.x		VF08,VF00,VF00w		IADD		VI03,VI02,VI04
+		FTOI15.w	VF08,VF00			LQ			VF02,-1(VI03)
+		NOP								IADD		VI03,VI03,VI04
+		ITOF4.xyz	VF02,VF02			LQ			VF01,-1(VI03)
+		ITOF4		VF03,VF01			MTIR		VI10,VF02w
+		
+Loop_SS:FTOI4.w		VF03,VF03			IADD		VI03,VI03,VI04
+		MUL.xyz		VF05,VF04,VF03		LQ			VF01,-1(VI03)
+		OPMULA.xyz	ACC,VF02,VF03		IADD		VI02,VI02,VI04
+		OPMSUB.xyz	VF04,VF03,VF02		FMEQ		VI10,VI10
+		ADDx		VF02,VF03,VF00x		IBEQ		VI10,VI00,Cull_SS
+		ITOF4		VF03,VF01			MTIR		VI10,VF03w
+		ADDAy.x		ACC,VF05,VF05y		IBNE		VI02,VI05,Loop_SS
+		MADDz.x		VF00,VF08,VF05z		NOP
+		
+		NOP								JR			VI01
+		NOP								ISUB		VI02,VI02,VI06
+		
+Cull_SS:ADDAy.x		ACC,VF05,VF05y		IBNE		VI02,VI05,Loop_SS
+		MADDz.x		VF00,VF08,VF05z		SQ.w		VF08,-1(VI02)
+		
+		NOP								JR			VI01
+		NOP								ISUB		VI02,VI02,VI06
+		
+		.endif
+		
+;-----------------------------------------------------------------------------------------------------------------------------
+; lines
+
+Line1:	NOP								IBEQ		VI03,VI00,Proj1+16
+		NOP								NOP
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; line culling
+
+CullLine:
+
+		.if 0
+		; unoptimised
+		
+		NOP								IADDIU		VI03,VI02,0			; source ptr = dest ptr
+		FTOI15.w	VF05,VF00			NOP								; set VF05w=0x8000 (for ADC bit)
+
+LoopKL:	NOP								IADD		VI03,VI03,VI04		; step source ptr
+		NOP								LQ.xyz		VF01,-1(VI03)		; get vertex coords
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		ITOF4.xyz	VF02,VF01			NOP								; vertex coords to float
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF12,VF02x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF02y		NOP								; row 1 view transform
+		MADDz		VF03,VF14,VF02z		NOP								; row 2 view transform
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MULA		ACC,VF10,VF03		DIV			Q,VF00w,VF03w		; inv viewport scale	; calc 1/w
+		MADDw		VF06,VF11,VF03w		NOP								; inv viewport offset
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF06xyz,VF06w		NOP								; generate outcodes
+		NOP								NOP
+		MULq.xyz	VF05,VF03,Q			NOP								; homogeneous divide
+		NOP								IADD		VI02,VI02,VI04		; step dest ptr
+		NOP								FCAND		VI01,0x000FFF		; test last 3 outcodes
+		NOP								IBNE		VI01,VI00,CullKL		; cull if all out
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopKL	; loop
+		NOP								SQ.xyz		VF05,-1(VI02)		; store screen coords
+		
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+CullKL:	NOP								IBNE		VI02,VI05,LoopKL	; loop
+		NOP								SQ			VF05,-1(VI02)		; store screen coords
+		
+		.else
+		; optimised
+		
+		FTOI15.w	VF05,VF00			IADD		VI03,VI02,VI04
+		ADDAx		ACC,VF15,VF00x		LQ.xyz		VF01,-1(VI03)
+		ITOF4.xyz	VF02,VF01			IADD		VI03,VI03,VI04
+		MADDAx		ACC,VF12,VF02x		LQ.xyz		VF01,-1(VI03)
+		MADDAy		ACC,VF13,VF02y		IADD		VI03,VI03,VI04
+		MADDz		VF04,VF14,VF02z		NOP
+		ITOF4.xyz	VF02,VF01			LQ.xyz		VF01,-1(VI03)
+		MULA		ACC,VF10,VF04		DIV			Q,VF00w,VF04w
+		MADDw		VF06,VF11,VF04w		NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF02x		NOP
+		MADDAy		ACC,VF13,VF02y		NOP
+		MADDz		VF03,VF14,VF02z		NOP
+		
+LoopKL:	CLIPw.xyz	VF06xyz,VF06w		IADD		VI03,VI03,VI04
+		MULq.xyz	VF05,VF04,Q			IADD		VI02,VI02,VI04
+		ITOF4.xyz	VF02,VF01			LQ.xyz		VF01,-1(VI03)
+		MULA		ACC,VF10,VF03		DIV			Q,VF00w,VF03w
+		MADDw		VF06,VF11,VF03w		FCAND		VI01,0x000FFF
+		ADDAx		ACC,VF15,VF00x		IBNE		VI01,VI00,CullKL
+		MADDAx		ACC,VF12,VF02x		MOVE.xyz	VF04,VF03
+		MADDAy		ACC,VF13,VF02y		IBNE		VI02,VI05,LoopKL
+		MADDz		VF03,VF14,VF02z		SQ.xyz		VF05,-1(VI02)
+		
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+CullKL:	MADDAy		ACC,VF13,VF02y		IBNE		VI02,VI05,LoopKL
+		MADDz		VF03,VF14,VF02z		SQ			VF05,-1(VI02)
+		
+		.endif
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+Shadow:
+		.if 0
+		; unoptimised version
+
+		NOP								IADDIU		VI03,VI02,0
+		NOP								LOI			0.5
+		MULi.w		VF04,VF00,I			NOP
+		NOP								MOVE.z		VF04,VF00
+		FTOI15.w	VF01,VF00			NOP
+		NOP								IADDIU		VI09,VI00,0x1F
+
+LoopSH:	NOP                             IADD		VI03,VI03,VI04
+		NOP								LQ.xyz		VF01,-1(VI03)
+		NOP								NOP
+		NOP								IAND		VI08,VI07,VI09
+		NOP								NOP
+		ITOF4.xyz	VF02,VF01			NOP
+		NOP								NOP
+		NOP								NOP
+		ADDAx.xy	ACC,VF27,VF00x		NOP
+		MADDx.x		VF03,VF16,VF02x		NOP
+		MADDz.y		VF03,VF16,VF02z		NOP
+		NOP								NOP
+		NOP								NOP
+		ADDy.z		VF04,VF27,VF02y		NOP
+		SUBw.xy		VF04,VF03,VF04w		NOP
+		FTOI12.xy	VF03,VF03			NOP
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF04xyz,VF04w		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								SQ.xy		VF03,0(VI02)
+		NOP								FCGET		VI07
+		NOP								IAND		VI01,VI01,VI07
+		NOP								IADD		VI02,VI02,VI04
+		NOP								IBNE		VI01,VI00,CullSH
+		NOP								IAND		VI01,VI07,VI08
+		NOP								IBNE		VI02,VI05,LoopSH
+		NOP								NOP
+		
+		NOP								B			EndSH
+		NOP								NOP
+		
+CullSH:	NOP								IBNE		VI02,VI05,LoopSH
+		NOP								SQ.w		VF01,-1(VI02)
+		
+		.else
+		; optimised version
+		
+		FTOI15.w	VF01,VF00			IADD		VI03,VI02,VI04
+		ADDAx.xy	ACC,VF27,VF00x		LQ.xyz		VF01,-1(VI03)
+		ITOF4.xyz	VF02,VF01			IADD		VI03,VI03,VI04
+		MADDx.x		VF03,VF16,VF02x		LQ.xyz		VF01,-1(VI03)
+		MADDz.y		VF03,VF16,VF02z		LOI			0.5
+		MULi.w		VF04,VF00,I			IADDIU		VI09,VI00,0x1F
+		ADDy.z		VF04,VF27,VF02y		NOP
+		SUBw.xy		VF04,VF03,VF04w		NOP
+		FTOI12.xy	VF03,VF03			NOP
+		ITOF4.xyz	VF02,VF01			NOP
+		CLIPw.xyz	VF04xyz,VF04w       MOVE.z		VF04,VF00
+		
+LoopSH:	ADDAx.xy	ACC,VF27,VF00x		SQ.xy		VF03,0(VI02)
+		MADDx.x		VF03,VF16,VF02x		IAND		VI08,VI07,VI09
+		MADDz.y		VF03,VF16,VF02z		IADD		VI03,VI03,VI04
+		NOP								FCGET		VI07
+		NOP								LQ.xyz		VF01,-1(VI03)
+		ADDy.z		VF04,VF27,VF02y		IAND		VI01,VI01,VI07
+		SUBw.xy		VF04,VF03,VF04w		IADD		VI02,VI02,VI04
+		FTOI12.xy	VF03,VF03			IBEQ		VI01,VI00,KeepSH
+		ITOF4.xyz	VF02,VF01			IAND		VI01,VI07,VI08
+		NOP								IBNE		VI02,VI05,LoopSH
+		CLIPw.xyz	VF04xyz,VF04w		SQ.w		VF01,-1(VI02)
+		
+		NOP								B			EndSH
+		NOP								NOP
+		
+KeepSH:	CLIPw.xyz	VF00xyz,VF00w		IBNE		VI02,VI05,LoopSH
+		CLIPw.xyz	VF04xyz,VF04w		NOP
+		
+		.endif
+		
+EndSH:	NOP                             ISUBIU		VI14,VI14,SHDW
+		NOP								B			PTex1
+		NOP								ISUB		VI02,VI02,VI06
+		
+;-----------------------------------------------------------------------------------------------------------------------------
+
+ReformatXforms:
+
+		NOP								LQ.xyz		VF01,3(VI00)
+		MULx.w		VF02,VF00,VF01x		XITOP		VI06
+		MULy.w		VF03,VF00,VF01y		IADDIU		VI01,VI00,0
+		
+LoopRT:	MULz.w		VF04,VF00,VF01z		LQ.xyz		VF01,7(VI01)
+		NOP								IADDIU		VI01,VI01,4
+		NOP								SQ.w		VF02,-4(VI01)
+		NOP								SQ.w		VF03,-3(VI01)
+		MULx.w		VF02,VF00,VF01x		IBNE		VI01,VI06,LoopRT
+		MULy.w		VF03,VF00,VF01y		SQ.w		VF04,-2(VI01)
+		
+		NOP[E]							NOP
+		NOP								NOP
+		
+		
+;-----------------------------------------------------------------------------------------------------------------------------
+
+; vertex format
+; -------------
+; (s,t,1,?)
+; (w0,w1,w2,?)
+; (nx:to0, ny:to1, nz:to2, ?)
+; (r,g,b,a)
+; (x,y,z,adc)
+
+
+
+Skin1:
+		;---------------------------------------------------------------
+		; wireframe
+		
+		; 63 62 61 60 59 58 57 56 55 54 53 52 51 50 49 58 47
+		; s  x  x  x  x  x  x  x  x  m  m  m  m  m  m  m  m
+		;                   <-------------PRIM------------->
+		;                         1  0  0  0  0  0  0  1  0
+		
+		NOP								IADDIU		VI01,VI00,WIRE
+		NOP								IAND		VI01,VI14,VI01
+		NOP								NOP
+		NOP								IBEQ		VI01,VI00,SkipWireframe
+		NOP								NOP
+		
+		NOP								ISUBIU		VI14,VI14,WIRE
+		
+		NOP								LQ.y		VF01,-1(VI02)
+		NOP								RINIT		R,VF01y
+		NOP								RGET.y		VF02,R
+		NOP								DIV			Q,VF00w,VF02y
+		MULq.y		VF03,VF01,Q			WAITQ
+		ADDAx.y		ACC,VF01,VF00x		LOI			0.0078125
+		MSUBAi.y	ACC,VF03,I			LOI			0.0625
+		MSUBi.y		VF04,VF03,I			NOP
+		NOP								SQ.y		VF04,-1(VI02)
+
+SkipWireframe:
+		;---------------------------------------------------------------
+	
+		NOP								IBNE		VI14,VI00,CullSkin
+		NOP								IADDIU		VI01,VI00,SHDW
+		
+		
+		.if 0
+		; unoptimised
+
+LoopS:	NOP								LQ.xyz		VF02,2(VI02)		; get normal & offsets
+		NOP								LQ.xyz		VF03,1(VI02)		; get weights
+		NOP								NOP
+		NOP								NOP
+		NOP								MTIR		VI08,VF02x										; offset of M0
+		NOP								MTIR		VI09,VF02y										; offset of M1
+		ITOF15.xyz	VF02,VF02			MTIR		VI10,VF02z			; normal to float			; offset of M2
+		ITOF15.xyz	VF03,VF03			LQ			VF05,0(VI08)		; weights to float			; get M0 row 0
+		NOP								LQ			VF06,1(VI08)									; get M0 row 1
+		NOP								LQ			VF07,2(VI08)									; get M0 row 2
+		NOP								NOP
+		MULAx.xyz	ACC,VF05,VF02x		LQ			VF08,0(VI09)		; nx*(M0 row 0)				; get M1 row 0
+		MADDAy.xyz	ACC,VF06,VF02y		LQ			VF30,0(VI10)		; ny*(M0 row 1)				; get M2 row 0
+		MADDz.xyz	VF02,VF07,VF02z		NOP								; nz*(M0 row 2)
+		MULAx		ACC,VF05,VF03x		NOP								; row 0 w0*M0
+		MADDAy		ACC,VF08,VF03y		NOP								; add row 0 w1*M1
+		MADDz		VF05,VF30,VF03z		NOP								; add row 0 w2*M2
+		MULAx.xyz	ACC,VF20,VF02x		LQ			VF08,1(VI09)		; lighting dot prods x part	; get M1 row 1
+		MADDAy.xyz	ACC,VF21,VF02y		LQ			VF30,1(VI10)		; lighting dot prods y part	; get M2 row 1
+		MADDz.xyz	VF02,VF22,VF02z		NOP								; lighting dot prods z part
+		MULAx		ACC,VF06,VF03x		MR32.z		VF31,VF05			; row 1 w0*M0
+		MADDAy		ACC,VF08,VF03y		LQ.xyz		VF01,4(VI02)		; add row 1 w1*M1			; get xyz
+		MADDz		VF06,VF30,VF03z		LQ.xyz		VF29,3(VI02)		; add row 1 w2*M2			; get rgb
+		MAXx.xyz	VF02,VF02,VF00x		LQ			VF08,2(VI09)		; clamp dot prods at 0		; get M1 row 2
+		NOP								LQ			VF30,2(VI10)									; get M2 row 2
+		NOP								MR32.y		VF31,VF31
+		MULAx		ACC,VF07,VF03x		MR32.z		VF31,VF06			; row 2 w0*M0
+		MADDAy		ACC,VF08,VF03y		NOP								; add row 2 w1*M1
+		MADDz		VF07,VF30,VF03z		NOP								; add row 2 w2*M2
+		ITOF4.xyz	VF01,VF01			NOP
+		ITOF0.xyz	VF29,VF29			NOP
+		ADDAx.xyz	ACC,VF23,VF00x		NOP								; ambient colour
+		MADDAx.xyz	ACC,VF24,VF02x		MR32.xy		VF31,VF31			; add diffuse 0
+		MADDAy.xyz	ACC,VF25,VF02y		MR32.z		VF31,VF07			; add diffuse 1
+		MADDz.xyz	VF02,VF26,VF02z		NOP								; add diffuse 2
+		MULAx.xyz	ACC,VF05,VF01x		NOP								; add x*(M row 0)
+		MADDAy.xyz	ACC,VF06,VF01y		NOP								; add y*(M row 1)
+		MADDAz.xyz	ACC,VF07,VF01z		NOP								; add z*(M row 2)
+		MADDw.xyz	VF01,VF31,VF00w		NOP								; M row 3
+		ADDAw.xyz	ACC,VF00,VF00w		NOP
+		MADD.xyz	VF02,VF02,VF29		NOP
+		ADDAx		ACC,VF19,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF16,VF01x		NOP								; row 0 view transform
+		MADDAy		ACC,VF17,VF01y		NOP								; row 1 view transform
+		MADDz		VF01,VF18,VF01z		LOI			1.00003039837		; row 2 view transform
+		MINIi.xyz	VF02,VF02,I			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								DIV			Q,VF00w,VF01w
+		NOP								SQ.xyz		VF02,3(VI02)
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MULq.xyz	VF01,VF01,Q			NOP
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopS
+		NOP								SQ.xyz		VF01,-1(VI02)
+		
+		.else
+		; optimised
+		
+		NOP								LQ.xyz		VF01,2(VI02)
+		NOP								LQ.xyz		VF03,1(VI02)
+		NOP								MTIR		VI08,VF01x
+		ITOF15.xyz	VF02,VF01			LQ			VF05,0(VI08)
+		ITOF15.xyz	VF03,VF03			LQ			VF06,1(VI08)
+		MULAx.xyz	ACC,VF05,VF02x		LQ			VF07,2(VI08)
+		MADDAy.xyz	ACC,VF06,VF02y		MTIR		VI09,VF01y
+		MADDz.xyz	VF02,VF07,VF02z		LQ			VF08,0(VI09)
+		MULAx		ACC,VF05,VF03x		MTIR		VI10,VF01z
+		MADDAy		ACC,VF08,VF03y		LQ			VF30,0(VI10)
+		MADDz		VF05,VF30,VF03z		LQ			VF08,1(VI09)
+		MULAx.xyz	ACC,VF20,VF02x		LQ			VF30,1(VI10)
+		MADDAy.xyz	ACC,VF21,VF02y		NOP
+		MADDz.xyz	VF02,VF22,VF02z		MR32.z		VF31,VF05
+		MULAx		ACC,VF06,VF03x		LQ			VF04,2(VI09)
+		MADDAy		ACC,VF08,VF03y		LQ			VF29,2(VI10)
+		MADDz		VF06,VF30,VF03z		LOI			0x3F8000FF										; I = 1+255/(2^23)
+
+
+LoopS:	MAXx.xyz	VF02,VF02,VF00x		LQ.xyz		VF01,4(VI02)		; clamp dot prods at 0		; get vertex
+		MULAx		ACC,VF07,VF03x		NOP								;  row 2 M0*w0
+		MADDAy		ACC,VF04,VF03y		MR32.y		VF31,VF31			; +row 2 M1*w1				; VF31 = (?,(M)30,?)
+		MADDz		VF07,VF29,VF03z		MR32.z		VF31,VF06			; +row 2 M2*w2				; VF31 = (?,(M)30,(M)31)
+		ITOF4.xyz	VF01,VF01			LQ.xyz		VF29,3(VI02)		; vertex to float			; get rgb
+		ADDAx.xyz	ACC,VF23,VF00x		NOP								;  ambient
+		MADDAx.xyz	ACC,VF24,VF02x		NOP								; +diffuse 0
+		MADDAy.xyz	ACC,VF25,VF02y		MR32.xy		VF31,VF31			; +diffuse 1				; VF31 = ((M)30,(M)31,?)
+		MADDz.xyz	VF04,VF26,VF02z		NOP								; +diffuse 2
+		ITOF0.xyz	VF29,VF29			MR32.z		VF31,VF07			; rgb to float				; VF31 = M row 3
+		MULAx.xyz	ACC,VF05,VF01x		LQ.xyz		VF02,7(VI02)		;  x * (M row 0)			; get normal and offsets
+		MADDAy.xyz	ACC,VF06,VF01y		LQ.xyz		VF03,6(VI02)		; +y * (M row 1)			; get weights
+		MADDAz.xyz	ACC,VF07,VF01z		NOP								; +z * (M row 2)
+		MADDw.xyz	VF01,VF31,VF00w		NOP								; +1 * (M row 3)
+		ADDAw.xyz	ACC,VF00,VF00w		MTIR		VI08,VF02x			;  (1,1,1)					; offset of M0
+		MADD.xyz	VF04,VF04,VF29		LQ			VF05,0(VI08)		; +illum * rgb				; get M0 row 0
+		ADDAx		ACC,VF19,VF00x		LQ			VF06,1(VI08)		; row 3 view transform		; get M0 row 1
+		MADDAx		ACC,VF16,VF01x		MTIR		VI09,VF02y			; row 0 view transform		; offset of M1
+		ITOF15.xyz	VF02,VF02			MTIR		VI10,VF02z			; normal to float			; offset of M2
+		MADDAy		ACC,VF17,VF01y		LQ			VF07,2(VI08)		; row 1 view transform		; get M0 row 2
+		MADDz		VF01,VF18,VF01z		LQ			VF08,0(VI09)		; row 2 view transform		; get M1 row 0
+		MINIi.xyz	VF04,VF04,I			NOP								; clamp rgb at 255
+		ITOF15.xyz	VF03,VF03			NOP								; weights to float
+		MULAx.xyz	ACC,VF05,VF02x		LQ			VF30,0(VI10)		;  nx * (M0 row 0)			; get M2 row 0
+		MADDAy.xyz	ACC,VF06,VF02y		DIV			Q,VF00w,VF01w		; +ny * (M0 row 1)			; calc 1/w
+		MADDz.xyz	VF02,VF07,VF02z		SQ.xyz		VF04,3(VI02)		; +nz * (M0 row 2)			; store colour
+		MULAx		ACC,VF05,VF03x		NOP								;  row 0 M0*w0
+		MADDAy		ACC,VF08,VF03y		LQ			VF08,1(VI09)		; +row 0 M1*w1				; get M1 row 1
+		MADDz		VF05,VF30,VF03z		LQ			VF30,1(VI10)		; +row 0 M2*w2				; get M2 row 1
+		MULAx.xyz	ACC,VF20,VF02x		NOP								; lighting dot prods x part
+		MADDAy.xyz	ACC,VF21,VF02y		IADD		VI02,VI02,VI04		; lighting dot prods y part	; step pointer
+		MULq.xyz	VF01,VF01,Q			LQ			VF04,2(VI09)		; homogeneous div (xyz)/w	; get M1 row 2
+		MADDz.xyz	VF02,VF22,VF02z		LQ			VF29,2(VI10)		; lighting dot prods z part	; get M2 row 2
+		MULAx		ACC,VF06,VF03x		MR32.z		VF31,VF05			;  row 1 M0*w0				; VF31 = (?,?,(M)30)
+		MADDAy		ACC,VF08,VF03y		IBNE		VI02,VI05,LoopS		; +row 1 M1*w1				; loop
+		MADDz		VF06,VF30,VF03z		SQ.xyz		VF01,-1(VI02)		; +row 1 M2*w2				; store screen coords
+		
+		.endif
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+		
+		
+		
+;-----------------------------------------------------------------------------------------------------------------------------
+
+CullSkin:
+		NOP								NOP								; need this cycle here
+		NOP								IBEQ		VI14,VI01,ShadowSkin
+		NOP								NOP
+		
+		; new version
+		
+		.if 0
+		; unoptimised
+		
+		FTOI15.w	VF03,VF00			NOP
+		
+		
+LoopKS:	NOP								LQ.xyz		VF02,2(VI02)		; get normal & offsets
+		NOP								LQ.xyz		VF03,1(VI02)		; get weights
+		NOP								NOP
+		NOP								NOP
+		NOP								MTIR		VI08,VF02x										; offset of M0
+		NOP								MTIR		VI09,VF02y										; offset of M1
+		ITOF15.xyz	VF02,VF02			MTIR		VI10,VF02z			; normal to float			; offset of M2
+		ITOF15.xyz	VF03,VF03			LQ			VF05,0(VI08)		; weights to float			; get M0 row 0
+		NOP								LQ			VF06,1(VI08)									; get M0 row 1
+		NOP								LQ			VF07,2(VI08)									; get M0 row 2
+		NOP								NOP
+		MULAx.xyz	ACC,VF05,VF02x		LQ			VF08,0(VI09)		; nx*(M0 row 0)				; get M1 row 0
+		MADDAy.xyz	ACC,VF06,VF02y		LQ			VF30,0(VI10)		; ny*(M0 row 1)				; get M2 row 0
+		MADDz.xyz	VF02,VF07,VF02z		NOP								; nz*(M0 row 2)
+		MULAx		ACC,VF05,VF03x		NOP								; row 0 w0*M0
+		MADDAy		ACC,VF08,VF03y		NOP								; add row 0 w1*M1
+		MADDz		VF05,VF30,VF03z		NOP								; add row 0 w2*M2
+		MULAx.xyz	ACC,VF20,VF02x		LQ			VF08,1(VI09)		; lighting dot prods x part	; get M1 row 1
+		MADDAy.xyz	ACC,VF21,VF02y		LQ			VF30,1(VI10)		; lighting dot prods y part	; get M2 row 1
+		MADDz.xyz	VF02,VF22,VF02z		NOP								; lighting dot prods z part
+		MULAx		ACC,VF06,VF03x		MR32.z		VF31,VF05			; row 1 w0*M0
+		MADDAy		ACC,VF08,VF03y		LQ.xyz		VF01,4(VI02)									; add row 1 w1*M1
+		MADDz		VF06,VF30,VF03z		LQ.xyz		VF29,3(VI02)									; add row 1 w2*M2
+		MAXx.xyz	VF02,VF02,VF00x		LQ			VF08,2(VI09)		; clamp dot prods at 0		; get M1 row 2
+		NOP								LQ			VF30,2(VI10)									; get M2 row 2
+		NOP								NOP
+		MULAx		ACC,VF07,VF03x		NOP
+		MADDAy		ACC,VF08,VF03y		MR32.y		VF31,VF31
+		MADDz		VF07,VF30,VF03z		MR32.z		VF31,VF06
+		ITOF4.xyz	VF01,VF01			NOP
+		ITOF0.xyz	VF29,VF29			NOP
+		ADDAx.xyz	ACC,VF23,VF00x		NOP								; ambient colour
+		MADDAx.xyz	ACC,VF24,VF02x		MR32.xy		VF31,VF31			; add diffuse 0
+		MADDAy.xyz	ACC,VF25,VF02y		MR32.z		VF31,VF07			; add diffuse 1
+		MADDz.xyz	VF02,VF26,VF02z		NOP								; add diffuse 2
+		MULAx.xyz	ACC,VF05,VF01x		NOP								; add x*(M row 0)
+		MADDAy.xyz	ACC,VF06,VF01y		NOP								; add y*(M row 1)
+		MADDAz.xyz	ACC,VF07,VF01z		NOP								; add z*(M row 2)
+		MADDw.xyz	VF01,VF31,VF00w		NOP								; M row 3
+		ADDAw.xyz	ACC,VF00,VF00w		NOP
+		MADD.xyz	VF02,VF02,VF29		NOP
+		ADDAx		ACC,VF19,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF16,VF01x		NOP								; row 0 view transform
+		MADDAy		ACC,VF17,VF01y		NOP								; row 1 view transform
+		MADDz		VF01,VF18,VF01z		LOI			1.00003039837		; row 2 view transform
+		MINIi.xyz	VF02,VF02,I			NOP
+		NOP								NOP
+		NOP								NOP
+		MULA		ACC,VF10,VF01		DIV			Q,VF00w,VF01w
+		MADDw		VF05,VF11,VF01w		SQ.xyz		VF02,3(VI02)
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF05xyz,VF05w		NOP
+		NOP								NOP
+		MULq.xyz	VF03,VF01,Q			NOP
+		NOP								IADD		VI02,VI02,VI04
+		NOP								FCAND		VI01,0x03FFFF
+		NOP								IBNE		VI01,VI00,CullKS
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopKS
+		NOP								SQ.xyz		VF03,-1(VI02)
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+CullKS:	NOP								IBNE		VI02,VI05,LoopKS
+		NOP								SQ			VF03,-1(VI02)
+		
+		.else
+		; optimised
+
+		FTOI15.w	VF04,VF00			LQ.xyz		VF01,2(VI02)		; set ADC bit
+		NOP								LQ.xyz		VF03,1(VI02)
+		NOP								MTIR		VI08,VF01x
+		NOP								LQ			VF05,0(VI08)
+		ITOF15.xyz	VF02,VF01			LQ			VF06,1(VI08)
+		ITOF15.xyz	VF03,VF03			LQ			VF07,2(VI08)
+		MULAx.xyz	ACC,VF05,VF02x		MTIR		VI09,VF01y
+		MADDAy.xyz	ACC,VF06,VF02y		MTIR		VI10,VF01z
+		MADDz.xyz	VF02,VF07,VF02z		LQ			VF08,0(VI09)
+		MULAx		ACC,VF05,VF03x		LQ			VF30,0(VI10)
+		MADDAy		ACC,VF08,VF03y		NOP
+		MADDz		VF05,VF30,VF03z		LQ			VF31,1(VI09)
+		MULAx.xyz	ACC,VF20,VF02x		LQ			VF29,1(VI10)
+		MADDAy.xyz	ACC,VF21,VF02y		LOI			0x3F8000FF										; I = 1+255/(2^23)
+		MADDz.xyz	VF02,VF22,VF02z		LQ			VF08,2(VI09)
+		MULAx		ACC,VF06,VF03x		LQ			VF30,2(VI10)
+		
+		
+LoopKS:	MADDAy		ACC,VF31,VF03y		MR32.z		VF31,VF05			; +row 1 M1*w1				; VF31 = (?,?,(M)30)
+		MADDz		VF06,VF29,VF03z		NOP								; +row 1 M2*w2
+		MAXx.xyz	VF02,VF02,VF00x		LQ.xyz		VF01,4(VI02)		; clamp dot prods at 0		; get vertex
+		MULAx		ACC,VF07,VF03x		LQ.xyz		VF29,3(VI02)		;  row 2 M0*w0				; get rgb
+		MADDAy		ACC,VF08,VF03y		MR32.y		VF31,VF31			; +row 2 M1*w1				; VF31 = (?,(M)30,?)
+		MADDz		VF07,VF30,VF03z		MR32.z		VF31,VF06			; +row 2 M2*w2				; VF31 = (?,(M)30,(M)31)
+		ITOF4.xyz	VF01,VF01			NOP								; vertex to float
+		ITOF0.xyz	VF29,VF29			NOP								; rgb to float
+		ADDAx.xyz	ACC,VF23,VF00x		NOP								; ambient
+		MADDAx.xyz	ACC,VF24,VF02x		MR32.xy		VF31,VF31			; +diffuse 0				; VF31 = ((M)30,(M)31,?)
+		MADDAy.xyz	ACC,VF25,VF02y		MR32.z		VF31,VF07			; +diffuse 1				; VF31 = M row 3
+		MADDz.xyz	VF04,VF26,VF02z		NOP								; +diffuse 2
+		MULAx.xyz	ACC,VF05,VF01x		LQ.xyz		VF02,7(VI02)		;  x * (M row 0)			; get normal and offsets
+		MADDAy.xyz	ACC,VF06,VF01y		NOP								; +y * (M row 1)
+		MADDAz.xyz	ACC,VF07,VF01z		NOP								; +z * (M row 2)
+		MADDw.xyz	VF01,VF31,VF00w		LQ.xyz		VF03,6(VI02)		; +1 * (M row 3)			; get weights
+		ADDAw.xyz	ACC,VF00,VF00w		NOP								;  (1,1,1)
+		MADD.xyz	VF04,VF04,VF29		MTIR		VI08,VF02x			; +illum * rgb				; offset of M0
+		ADDAx		ACC,VF19,VF00x		LQ			VF05,0(VI08)		; row 3 view transform		; get M0 row 0
+		MADDAx		ACC,VF16,VF01x		LQ			VF06,1(VI08)		; row 0 view transform		; get M0 row 1
+		MADDAy		ACC,VF17,VF01y		MTIR		VI09,VF02y			; row 1 view transform		; offset of M1
+		MADDz		VF01,VF18,VF01z		MTIR		VI10,VF02z			; row 2 view transform		; offset of M2
+		MINIi.xyz	VF04,VF04,I			LQ			VF07,2(VI08)		; clamp rgb at 255			; get M0 row 2
+		ITOF15.xyz	VF02,VF02			LQ			VF08,0(VI09)		; normal to float			; get M1 row 0
+		ITOF15.xyz	VF03,VF03			NOP								; weights to float
+		MULA		ACC,VF10,VF01		DIV			Q,VF00w,VF01w		; inverse viewport scale	; calc 1/w
+		MADDw		VF31,VF11,VF01w		SQ.xyz		VF04,3(VI02)		; inverse viewport offset	; store colour
+		MULAx.xyz	ACC,VF05,VF02x		LQ			VF30,0(VI10)		;  nx * (M0 row 0)			; get M2 row 0
+		MADDAy.xyz	ACC,VF06,VF02y		NOP								; +ny * (M0 row 1)
+		MADDz.xyz	VF02,VF07,VF02z		NOP								; +nz * (M0 row 2)
+		CLIPw.xyz	VF31xyz,VF31w		LQ			VF31,1(VI09)		; generate clip codes		; get M1 row 1
+		MULAx		ACC,VF05,VF03x		LQ			VF29,1(VI10)		;  row 0 M0*w0				; get M2 row 1
+		MADDAy		ACC,VF08,VF03y		IADD		VI02,VI02,VI04		; +row 0 M1*w1				; step pointer
+		MADDz		VF05,VF30,VF03z		LQ			VF08,2(VI09)		; +row 0 M2*w2				; get M1 row 2
+		MULq.xyz	VF04,VF01,Q			FCAND		VI01,0x03FFFF		; homogeneous div (xyz)/w	; last 3 clip codes
+		MULAx.xyz	ACC,VF20,VF02x		IBNE		VI01,VI00,CullKS	; lighting dot prods x part	; cull if any non-zero
+		MADDAy.xyz	ACC,VF21,VF02y		LQ			VF30,2(VI10)		; lighting dot prods y part	; get M2 row 2
+		MADDz.xyz	VF02,VF22,VF02z		IBNE		VI02,VI05,LoopKS	; lighting dot prods z part	; loop
+		MULAx		ACC,VF06,VF03x		SQ.xyz		VF04,-1(VI02)		;  row 1 M0*w0				; store screen coords
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+CullKS:	MADDz.xyz	VF02,VF22,VF02z		IBNE		VI02,VI05,LoopKS	; lighting dot prods z part ; loop
+		MULAx		ACC,VF06,VF03x		SQ			VF04,-1(VI02)       ;  row 1 M0*w0				; store screen coords
+		
+		.endif
+		
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; shadow version
+
+ShadowSkin:
+
+		.if 0
+		; unoptimised
+		
+LoopSS:
+		NOP								ILW.x		VI08,2(VI02)		; get primary transform offset
+		NOP								LQ.xyz		VF01,4(VI02)		; get vertex coords
+		ITOF4.xyz	VF01,VF01			NOP								; vertex coords to float
+		NOP								LQ			VF04,0(VI08)		; get M0 row 0
+		NOP								LQ			VF05,1(VI08)        ; get M0 row 1
+		NOP								LQ			VF06,2(VI08)		; get M0 row 2
+		ADDAw.x		ACC,VF00,VF04w		NOP								; ACCx = (M0)30
+		ADDAw.y		ACC,VF00,VF05w		NOP								; ACCy = (M0)31
+		ADDAw.z		ACC,VF00,VF06w		NOP								; ACCz = (M0)32
+		MADDAx.xyz	ACC,VF04,VF01x		NOP								; +x * M0 row 0
+		MADDAy.xyz	ACC,VF05,VF01y		NOP								; +y * M0 row 1
+		MADDz.xyz	VF01,VF06,VF01z		NOP								; +z * M0 row 2
+		NOP								IADD		VI02,VI02,VI04		; step pointer
+		ADDAx		ACC,VF15,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF12,VF01x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF01y		NOP								; row 1 view transform
+		MADDz		VF01,VF14,VF01z		NOP								; row 2 view transform
+		NOP								DIV			Q,VF00w,VF01w		; calc 1/w
+		MULq.xyz	VF01,VF01,Q			WAITQ							; homogeneous div (xyz)/w
+		NOP								IBNE		VI02,VI05,LoopSS	; loop
+		NOP								SQ.xyz		VF01,-1(VI02)		; store screen coords
+		
+		.else
+		; optimised
+		
+		NOP								ILW.x		VI08,2(VI02)
+		NOP								LQ			VF01,4(VI02)
+		ITOF4.xyz	VF02,VF01			LQ			VF08,3(VI08)
+		ADDAx.xyz	ACC,VF08,VF00		LQ			VF05,0(VI08)
+		MADDAx.xyz	ACC,VF05,VF02x		LQ			VF06,1(VI08)
+		MADDAy.xyz	ACC,VF06,VF02y		LQ			VF07,2(VI08)
+		MADDz.xyz	VF02,VF07,VF02z		ILW.x		VI08,7(VI02)
+		ADDAx		ACC,VF15,VF00x		LQ			VF01,9(VI02)
+		MADDAx		ACC,VF12,VF02x		LQ			VF05,0(VI08)
+		MADDAy		ACC,VF13,VF02y		LQ			VF06,1(VI08)
+		MADDz		VF03,VF14,VF02z		LQ			VF07,2(VI08)
+		
+LoopSS:	ITOF4.xyz	VF02,VF01			ILW.x		VI08,12(VI02)
+		ADDAw.x		ACC,VF00,VF05w		IADD		VI02,VI02,VI04
+		ADDAw.y		ACC,VF00,VF06w		DIV			Q,VF00w,VF03w
+		ADDAw.z		ACC,VF00,VF07w		NOP
+		MADDAx.xyz	ACC,VF05,VF02x		NOP
+		MADDAy.xyz	ACC,VF06,VF02y		LQ			VF01,9(VI02)
+		MADDz.xyz	VF02,VF07,VF02z		LQ			VF05,0(VI08)
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP
+		MULq.xyz	VF04,VF03,Q			LQ			VF06,1(VI08)
+		MADDAx		ACC,VF12,VF02x		LQ			VF07,2(VI08)
+		MADDAy		ACC,VF13,VF02y		NOP
+		MADDz		VF03,VF14,VF02z		IBNE		VI02,VI05,LoopSS
+		NOP								SQ.xyz		VF04,-1(VI02)
+		
+		.endif
+
+		NOP								B			NextPrim
+		NOP								LQI			VF01,(VI02++)
+
+
+
+
+
+
+
+
+
+
+
+
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+
+		; context data:
+		
+		; VF14 = shadow vec (magnitude defines length of shadow polys), in body coords
+		; VF15 = tweak vec (small, parallel to shadow vec), in body coords
+		; VF16-19 = body to frustum transform
+
+
+		
+		;      3-----0-----5
+		;		\   / \   /
+		;        \ /   \ /
+		;         1-----2
+		;          \   /
+		;			\ /
+		;            4
+
+
+ShadowVolumeSkin:
+
+		; set up VF07 = VF14x*VF16 + VF14y*VF17 + VF14z*VF18 + VF19
+		MULAx		ACC,VF16,VF14x		NOP
+		MADDAy		ACC,VF17,VF14y		NOP
+		MADDAz		ACC,VF18,VF14z		NOP
+		MADDw		VF07,VF19,VF00w		NOP
+		
+		; set up VF08 = VF15x*VF16 + VF15y*VF17 + VF15z*VF18 + VF19
+		MULAx		ACC,VF16,VF15x		NOP
+		MADDAy		ACC,VF17,VF15y		NOP
+		MADDAz		ACC,VF18,VF15z		NOP
+		MADDw		VF08,VF19,VF00w		IADDIU		VI09,VI00,0x10		; mask for Sw FMAC flag
+
+		NOP								IADDIU		VI08, VI00, 0
+
+LoopSVS:
+
+		NOP								LQ			VF20,1(VI02)		; | Load vector 0
+		NOP								LQ			VF21,2(VI02)        ; | Load vector 1 
+		NOP								LQ			VF22,3(VI02)        ; | Load vector 2 
+		NOP								LQ			VF23,4(VI02)        ; | Load vector 3 
+		NOP								LQ			VF24,5(VI02)        ; | Load vector 4 
+		
+		NOP								MTIR		VI01,VF20w			; | Load up matrix 0 index
+		NOP								LQ			VF04,3(VI01)
+		NOP								LQ			VF01,0(VI01)
+		NOP								LQ			VF02,1(VI01)
+		NOP								LQ			VF03,2(VI01)
+
+		; v0
+		ADDAx.xyz	ACC,VF04,VF00x		MTIR		VI01,VF21w          ; | Load up matrix 1 index 
+		MADDAx.xyz	ACC,VF01,VF20x		LQ			VF04,3(VI01)
+		MADDAy.xyz	ACC,VF02,VF20y		LQ			VF01,0(VI01)
+		MADDz.xyz	VF20,VF03,VF20z		LQ			VF02,1(VI01)
+		NOP								LQ			VF03,2(VI01)
+
+		; v1
+		ADDAx.xyz	ACC,VF04,VF00x		MTIR		VI01,VF22w          ; | Load up matrix 2 index 
+		MADDAx.xyz	ACC,VF01,VF21x		LQ			VF04,3(VI01)
+		MADDAy.xyz	ACC,VF02,VF21y		LQ			VF01,0(VI01)
+		MADDz.xyz	VF21,VF03,VF21z		LQ			VF02,1(VI01)
+		NOP								LQ			VF03,2(VI01)
+
+		; v2
+		ADDAx.xyz	ACC,VF04,VF00x		MTIR		VI01,VF23w          ; | Load up matrix 3 index 
+		MADDAx.xyz	ACC,VF01,VF22x		LQ			VF04,3(VI01)
+		MADDAy.xyz	ACC,VF02,VF22y		LQ			VF01,0(VI01)
+		MADDz.xyz	VF22,VF03,VF22z		LQ			VF02,1(VI01)
+		SUB.xyz		VF26,VF21,VF20      LQ			VF03,2(VI01)
+
+		; v3
+		ADDAx.xyz	ACC,VF04,VF00x		LQ			VF25,6(VI02)        ; | Load vector 5
+		MADDAx.xyz	ACC,VF01,VF23x		MTIR		VI01,VF24w          ; | Load up matrix 4 index 
+		SUB.xyz		VF27,VF22,VF20		LQ			VF04,3(VI01)
+		MADDAy.xyz	ACC,VF02,VF23y		LQ			VF01,0(VI01)
+		MADDz.xyz	VF23,VF03,VF23z		LQ			VF02,1(VI01)
+		NOP								LQ			VF03,2(VI01)
+
+		; v4
+		OPMULA.xyz	ACC,VF26,VF27		NOP
+		OPMSUB.xyz	VF05,VF27,VF26		NOP
+		ADDAx.xyz	ACC,VF04,VF00x		MTIR		VI01,VF25w          ; | Load up matrix 5 index 
+		MADDAx.xyz	ACC,VF01,VF24x		LQ			VF04,3(VI01)
+		MADDAy.xyz	ACC,VF02,VF24y		LQ			VF01,0(VI01)
+		MUL.xyz		VF05,VF05,VF15		LQ			VF02,1(VI01)
+		MADDz.xyz	VF24,VF03,VF24z		LQ			VF03,2(VI01)
+		
+		; v5
+		ADDAx.xyz	ACC,VF04,VF00x		NOP
+		MADDAx.xyz	ACC,VF01,VF25x		NOP
+		ADDy.x		VF05,VF05,VF05y		NOP
+		MADDAy.xyz	ACC,VF02,VF25y		NOP
+		MADDz.xyz	VF25,VF03,VF25z		NOP
+		
+											   
+		SUB.xyz		VF02,VF21,VF23		NOP
+		ADDz.x		VF00,VF05,VF05z		NOP
+		SUB.xyz		VF06,VF22,VF24		NOP
+		SUB.xyz		VF05,VF21,VF24		NOP
+		OPMULA.xyz	ACC,VF02,VF26		ILW.w		VI15,0(VI02)
+		SUB.xyz		VF04,VF25,VF20		FSAND		VI01,2
+		OPMSUB.xyz	VF02,VF26,VF02		IBEQ		VI01,VI00,CullPrism
+		OPMULA.xyz	ACC,VF05,VF06		NOP
+		OPMSUB.xyz	VF03,VF06,VF05		NOP
+		OPMULA.xyz	ACC,VF04,VF27		NOP
+		OPMSUB.xyz	VF04,VF27,VF04		NOP
+
+		; compute and project v0,v1,v2 and their translates
+		MULAx		ACC,VF16,VF22x		NOP
+		MADDAy		ACC,VF17,VF22y		NOP
+		MADDAz		ACC,VF18,VF22z		NOP
+		MADDw		VF22,VF08,VF00w		NOP
+		MADDw		VF25,VF07,VF00w		NOP
+		
+		
+		MULA		ACC,VF10,VF22		NOP
+		MADDw		VF12,VF11,VF22w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF12xyz,VF12w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		NOP								FCAND		VI01,0x00003F
+		NOP								IBNE		VI01,VI00,CullPrism
+		NOP								NOP
+		
+		
+		MULAx		ACC,VF16,VF21x		NOP
+		MADDAy		ACC,VF17,VF21y		NOP
+		MADDAz		ACC,VF18,VF21z		ERCPR		P,VF22w
+		MADDw		VF21,VF08,VF00w		DIV			Q,VF00w,VF25w
+		MADDw		VF24,VF07,VF00w		NOP
+		
+		
+		
+		MULAx		ACC,VF16,VF20x		MFIR.w      VF22,VI00
+		MADDAy		ACC,VF17,VF20y		NOP
+		MADDAz		ACC,VF18,VF20z		NOP
+		MADDw		VF20,VF08,VF00w		NOP
+		MADDw		VF23,VF07,VF00w		NOP
+
+		MULA		ACC,VF10,VF24		NOP
+		MADDw		VF01,VF11,VF24w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF01xyz,VF01w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		NOP								FCAND		VI01,0x00003F
+		NOP								IBNE		VI01,VI00,CullPrism
+		NOP								NOP
+
+		
+		MULA		ACC,VF10,VF25		NOP
+		MADDw		VF12,VF11,VF25w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF12xyz,VF12w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		NOP								FCAND		VI01,0x00003F
+		NOP								IBNE		VI01,VI00,CullPrism
+		NOP								NOP
+
+
+		MULA		ACC,VF10,VF21		NOP
+		MADDw		VF12,VF11,VF21w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF12xyz,VF12w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		NOP								FCAND		VI01,0x00003F
+		NOP								IBNE		VI01,VI00,CullPrism
+		NOP								NOP
+		
+		
+		MULq.xyz	VF25,VF25,Q			DIV			Q,VF00w,VF21w
+		MUL.xyz		VF02,VF02,VF15		NOP
+		MUL.xyz		VF03,VF03,VF15		NOP
+		MUL.xyz		VF04,VF04,VF15		NOP
+		FTOI15.w	VF21,VF00			MFP.w		VF01,P
+		ADDy.x		VF02,VF02,VF02y		ERCPR		P,VF24w
+		ADDx.y		VF03,VF03,VF03x		SQ.xyz		VF25,6(VI02)
+		
+		MULA		ACC,VF10,VF23		NOP
+		MADDw		VF12,VF11,VF23w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF12xyz,VF12w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		NOP								FCAND		VI01,0x00003F
+		NOP								IBNE		VI01,VI00,CullPrism
+		NOP								NOP
+		
+		
+		
+		; vf20-25 = verts.	 
+		
+		MULA		ACC,VF10,VF20		NOP
+		MADDw		VF12,VF11,VF20w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF12xyz,VF12w		NOP
+		NOP								NOP			; needs to be 3 nops
+		NOP								NOP
+		NOP								NOP
+		NOP								FCAND		VI01,0x00003F
+		NOP								IBNE		VI01,VI00,CullPrism
+		NOP								NOP
+		
+
+		
+		MULq.xyz	VF21,VF21,Q			DIV			Q,VF00w,VF20w
+		
+		
+		
+		
+		
+		
+		
+		MULw.xyz	VF22,VF22,VF01w		SQ.w		VF21,2(VI02)
+		ADDx.z		VF04,VF04,VF04x		NOP
+		MULx.w		VF05,VF00,VF25x		NOP
+		ADDz.x		VF02,VF02,VF02z		SQ			VF21,4(VI02)
+		ADDz.y		VF03,VF03,VF03z		SQ			VF22,16(VI02)
+		ADDy.z		VF04,VF04,VF04y		SQ.xyz		VF22,2(VI02)
+		MULq.xyz	VF20,VF20,Q			DIV			Q,VF00w,VF23w
+		SUB.w		VF23,VF00,VF00		IADDIU      VI10, VI00, 0	;FSAND		VI10,2			; get adc results (4 cycles after mac)
+		ADDy.x		VF05,VF00,VF25y		IADDIU      VI11, VI00, 0  ;FSAND		VI11,2
+		MULx.w		VF22,VF00,VF22x		IADDIU      VI12, VI00, 0  ;FSAND		VI12,2
+		ADDy.x		VF22,VF00,VF22y		MFP.w		VF01,P
+		MULx.w		VF26,VF00,VF21x		NOP	;ISUBIU		VI10,VI10,1
+		ADDy.x		VF26,VF00,VF21y		NOP ;ISUBIU		VI11,VI11,1
+
+		MULq.xyz	VF23,VF23,Q			NOP ;ISUBIU		VI12,VI12,1
+		
+;		SUB.w		VF23,VF00,VF00		FSAND		VI10,2			; get adc results (4 cycles after mac)
+;		ADDy.x		VF05,VF00,VF25y		FSAND		VI11,2
+;		MULx.w		VF22,VF00,VF22x		FSAND		VI12,2
+;		ADDy.x		VF22,VF00,VF22y		MFP.w		VF01,P
+;		MULx.w		VF26,VF00,VF21x		ISUBIU		VI10,VI10,1
+;		ADDy.x		VF26,VF00,VF21y		ISUBIU		VI11,VI11,1
+;		
+;		MULq.xyz	VF23,VF23,Q			ISUBIU		VI12,VI12,1
+		MULw.xyz	VF24,VF24,VF01w		SQ.xyz		VF21,12(VI02)
+		
+		NOP								SQ			VF23,10(VI02)
+		NOP								MFIR.w		VF23,VI12
+		NOP								ISW.w		VI10,12(VI02)
+		NOP								ISW.w		VI11,6(VI02)
+
+		; backface testing and colours (8 tests)
+		SUB.xw		VF01,VF22,VF26		MR32.xw		VF04,VF24
+		SUB.xw		VF02,VF05,VF26		MFIR.w		VF20,VI10
+		NOP								MFIR.w		VF24,VI11
+		NOP								MR32.xw		VF06,VF23
+		
+		
+		
+		
+		SUB.xw		VF03,VF05,VF04		MFIR.w		VF25,VI12
+		MULAx.w		ACC,VF01,VF02x		SQ			VF23,18(VI02)
+		MSUBx.w		VF00,VF02,VF01x		SQ			VF20,14(VI02)
+
+		SUB.xw		VF01,VF06,VF04		MR32.xw		VF20,VF20
+		MULAx.w		ACC,VF03,VF02x		SQ			VF24,8(VI02)
+		MSUBx.w		VF00,VF02,VF03x		SQ			VF25,20(VI02)
+
+		SUB.xw		VF02,VF06,VF26		FMAND		VI01,VI09
+		MULAx.w		ACC,VF03,VF01x		ISUBIU		VI01,VI01,8
+		MSUBx.w		VF00,VF01,VF03x		ISW.xyz		VI01,5(VI02)
+
+		SUB.xw		VF03,VF20,VF26		FMAND		VI01,VI09
+		MULAx.w		ACC,VF02,VF01x		ISUBIU		VI01,VI01,8
+		MSUBx.w		VF00,VF01,VF02x		ISW.xyz		VI01,7(VI02)
+
+		SUB.xw		VF01,VF20,VF22		FMAND		VI01,VI09
+		MULAx.w		ACC,VF02,VF03x		ISUBIU		VI01,VI01,8
+		MSUBx.w		VF00,VF03,VF02x		ISW.xyz		VI01,9(VI02)
+
+		SUB.xw		VF02,VF06,VF22		FMAND		VI01,VI09
+		MULAx.w		ACC,VF01,VF03x		ISUBIU		VI01,VI01,8
+		MSUBx.w		VF00,VF03,VF01x		ISW.xyz		VI01,11(VI02)
+
+		SUB.xw		VF03,VF06,VF05		FMAND		VI01,VI09
+		MULAx.w		ACC,VF01,VF02x		ISUBIU		VI01,VI01,8
+		MSUBx.w		VF00,VF02,VF01x		ISW.xyz		VI01,13(VI02)
+
+		NOP								FMAND		VI01,VI09
+		MULAx.w		ACC,VF03,VF02x		ISUBIU		VI01,VI01,8
+		MSUBx.w		VF00,VF02,VF03x		ISW.xyz		VI01,15(VI02)
+
+		NOP								FMAND		VI01,VI09
+		NOP								ISUBIU		VI01,VI01,8
+		NOP								ISW.xyz		VI01,17(VI02)
+
+		NOP								FMAND		VI01,VI09
+		NOP								ISUBIU		VI01,VI01,8
+		NOP								ISW.xyz		VI01,19(VI02)
+
+		NOP								IADDIU		VI08, VI00, 1
+		NOP								XGKICK		VI02
+		
+CullPrism:
+
+		NOP								IBGEZ		VI15,LoopSVS
+		NOP								IADDIU		VI02,VI02,21
+
+		NOP								IBEQ		VI08, VI00, DummyKick
+		NOP								NOP
+		
+		NOP[E]							NOP
+		NOP								NOP
+
+DummyKick:
+		NOP								ISUBIU		VI01, VI02, 1
+		NOP								IADDIU		VI08, VI00, 0x4000
+		NOP								IADDIU      VI08, VI08, 0x4000
+		NOP								ISW.x		VI08, 0(VI01)
+		NOP								XGKICK		VI01
+
+		NOP[E]							NOP
+		NOP								NOP
+
+
+
+
+
+
+		.if 0
+		; original unoptimised version
+ 
+LoopSVS:
+		; v0
+		NOP								LQ			VF20,0(VI02)
+		NOP								MTIR		VI01,VF20w
+		NOP								LQ			VF04,3(VI01)
+		NOP								LQ			VF01,0(VI01)
+		NOP								LQ			VF02,1(VI01)
+		NOP								LQ			VF03,2(VI01)
+
+		ADDAx.xyz	ACC,VF04,VF00x		NOP
+		MADDAx.xyz	ACC,VF01,VF20x		NOP
+		MADDAy.xyz	ACC,VF02,VF20y		NOP
+		MADDz.xyz	VF20,VF03,VF20z		NOP
+
+		; v1
+		NOP								LQ			VF21,1(VI02)
+		NOP								MTIR		VI01,VF21w
+		NOP								LQ			VF04,3(VI01)
+		NOP								LQ			VF01,0(VI01)
+		NOP								LQ			VF02,1(VI01)
+		NOP								LQ			VF03,2(VI01)
+
+		ADDAx.xyz	ACC,VF04,VF00x		NOP
+		MADDAx.xyz	ACC,VF01,VF21x		NOP
+		MADDAy.xyz	ACC,VF02,VF21y		NOP
+		MADDz.xyz	VF21,VF03,VF21z		NOP
+
+		; v2
+		NOP								LQ			VF22,2(VI02)
+		NOP								MTIR		VI01,VF22w
+		NOP								LQ			VF04,3(VI01)
+		NOP								LQ			VF01,0(VI01)
+		NOP								LQ			VF02,1(VI01)
+		NOP								LQ			VF03,2(VI01)
+
+		ADDAx.xyz	ACC,VF04,VF00x		NOP
+		MADDAx.xyz	ACC,VF01,VF22x		NOP
+		MADDAy.xyz	ACC,VF02,VF22y		NOP
+		MADDz.xyz	VF22,VF03,VF22z		NOP
+
+
+		; generate n021
+		SUB.xyz		VF05,VF20,VF22		NOP
+		SUB.xyz		VF06,VF21,VF22		NOP
+		OPMULA.xyz	ACC,VF05,VF06		NOP
+		OPMSUB.xyz	VF01,VF06,VF05		NOP
+
+		; dot with light vector
+		MUL.xyz		VF01,VF01,VF15		NOP
+		ADDy.x		VF01,VF01,VF01y		NOP
+		ADDz.x		VF01,VF01,VF01z		MOVE		VF02,VF01
+		
+		; cull if dot product negative
+		;NOP								NOP
+		;NOP								NOP
+		;NOP								NOP
+		FTOI0		VF02,VF02			FSAND		VI01,2
+		NOP								IBEQ		VI01,VI00,CullPrism
+		NOP								NOP
+
+
+		; v3
+		NOP								LQ			VF23,3(VI02)
+		NOP								MTIR		VI01,VF23w
+		NOP								LQ			VF04,3(VI01)
+		NOP								LQ			VF01,0(VI01)
+		NOP								LQ			VF02,1(VI01)
+		NOP								LQ			VF03,2(VI01)
+
+		ADDAx.xyz	ACC,VF04,VF00x		NOP
+		MADDAx.xyz	ACC,VF01,VF23x		NOP
+		MADDAy.xyz	ACC,VF02,VF23y		NOP
+		MADDz.xyz	VF23,VF03,VF23z		NOP
+
+		; v4
+		NOP								LQ			VF24,4(VI02)
+		NOP								MTIR		VI01,VF24w
+		NOP								LQ			VF04,3(VI01)
+		NOP								LQ			VF01,0(VI01)
+		NOP								LQ			VF02,1(VI01)
+		NOP								LQ			VF03,2(VI01)
+
+		ADDAx.xyz	ACC,VF04,VF00x		NOP
+		MADDAx.xyz	ACC,VF01,VF24x		NOP
+		MADDAy.xyz	ACC,VF02,VF24y		NOP
+		MADDz.xyz	VF24,VF03,VF24z		NOP
+
+		; v5
+		NOP								LQ			VF25,5(VI02)
+		NOP								MTIR		VI01,VF25w
+		NOP								LQ			VF04,3(VI01)
+		NOP								LQ			VF01,0(VI01)
+		NOP								LQ			VF02,1(VI01)
+		NOP								LQ			VF03,2(VI01)
+
+		ADDAx.xyz	ACC,VF04,VF00x		NOP
+		MADDAx.xyz	ACC,VF01,VF25x		NOP
+		MADDAy.xyz	ACC,VF02,VF25y		NOP
+		MADDz.xyz	VF25,VF03,VF25z		NOP
+		
+		
+		
+
+		; generate n013
+		SUB.xyz		VF06,VF20,VF21		NOP
+		SUB.xyz		VF05,VF23,VF21		NOP
+		OPMULA.xyz	ACC,VF05,VF06		NOP
+		OPMSUB.xyz	VF02,VF06,VF05		NOP
+
+		; generate n241
+		SUB.xyz		VF06,VF22,VF24		NOP
+		SUB.xyz		VF05,VF21,VF24		NOP
+		OPMULA.xyz	ACC,VF05,VF06		NOP
+		OPMSUB.xyz	VF03,VF06,VF05		NOP
+
+		; generate n052
+		SUB.xyz		VF06,VF20,VF25		NOP
+		SUB.xyz		VF05,VF22,VF25		NOP
+		OPMULA.xyz	ACC,VF05,VF06		NOP
+		OPMSUB.xyz	VF04,VF06,VF05		NOP
+
+
+		; take dot products with light vec
+		MUL.xyz		VF02,VF02,VF15		NOP
+		MUL.xyz		VF03,VF03,VF15		NOP
+		MUL.xyz		VF04,VF04,VF15		NOP
+		
+		NOP								NOP
+		ADDy.x		VF02,VF02,VF02y		NOP
+		ADDx.y		VF03,VF03,VF03x		NOP
+		ADDx.z		VF04,VF04,VF04x		NOP
+
+		NOP								NOP
+		ADDz.x		VF02,VF02,VF02z		IADDIU		VI10,VI00,0x80
+		ADDz.y		VF03,VF03,VF03z		IADDIU		VI11,VI00,0x40
+		ADDy.z		VF04,VF04,VF04y		IADDIU		VI12,VI00,0x20
+		
+		; get ADC results
+		NOP								NOP
+		NOP								FMAND		VI10,VI10
+		NOP								FMAND		VI11,VI11
+		NOP								FMAND		VI12,VI12
+		
+		NOP								ISUBIU		VI10,VI10,1
+		NOP								ISUBIU		VI11,VI11,1
+		NOP								ISUBIU		VI12,VI12,1
+
+
+		; compute and project v0,v1,v2 and their translates
+		MULAx		ACC,VF16,VF20x		NOP
+		MADDAy		ACC,VF17,VF20y		NOP
+		MADDAz		ACC,VF18,VF20z		NOP
+		MADDw		VF20,VF08,VF00w		NOP
+		MADDw		VF23,VF07,VF00w		NOP
+		NOP								DIV			Q,VF00w,VF20w
+		MULq.xyz	VF20,VF20,Q			WAITQ
+		NOP								DIV			Q,VF00w,VF23w
+		MULq.xyz	VF23,VF23,Q			WAITQ
+
+		MULAx		ACC,VF16,VF21x		NOP
+		MADDAy		ACC,VF17,VF21y		NOP
+		MADDAz		ACC,VF18,VF21z		NOP
+		MADDw		VF21,VF08,VF00w		NOP
+		MADDw		VF24,VF07,VF00w		NOP
+		NOP								DIV			Q,VF00w,VF21w
+		MULq.xyz	VF21,VF21,Q			WAITQ
+		NOP								DIV			Q,VF00w,VF24w
+		MULq.xyz	VF24,VF24,Q			WAITQ
+
+		MULAx		ACC,VF16,VF22x		NOP
+		MADDAy		ACC,VF17,VF22y		NOP
+		MADDAz		ACC,VF18,VF22z		NOP
+		MADDw		VF22,VF08,VF00w		NOP
+		MADDw		VF25,VF07,VF00w		NOP
+		NOP								DIV			Q,VF00w,VF22w
+		MULq.xyz	VF22,VF22,Q			WAITQ
+		NOP								DIV			Q,VF00w,VF25w
+		MULq.xyz	VF25,VF25,Q			WAITQ
+
+
+		;   0
+		;  /|\
+		; 2---1
+		; | | |
+		; | 3 |
+		; |/ \|
+		; 5---4
+		;
+		; adc's a(01), b(12), c(20)
+		;
+		; 2, 1, 5, 4, 3, 1, 0, 2, 3, 5
+		; 1, 1, b, b, 0, a, a, 0, c, c
+
+		; store positions and adc's
+		FTOI15.w	VF22,VF00			NOP
+		NOP								SQ			VF22,1(VI02)
+		FTOI15.w	VF21,VF00			NOP
+		NOP								SQ			VF21,3(VI02)
+		
+		FTOI15.w	VF25,VF00			NOP
+;		NOP								MFIR.w		VF25,VI11
+		NOP								SQ			VF25,5(VI02)
+		FTOI15.w	VF24,VF00			NOP
+;		NOP								MFIR.w		VF24,VI11
+		NOP								SQ			VF24,7(VI02)
+		
+		;FTOI15.w	VF23,VF00			NOP
+		NOP								MFIR.w		VF23,VI00
+		NOP								SQ			VF23,9(VI02)
+		
+;		NOP								MFIR.w		VF21,VI10
+		FTOI15.w	VF21,VF00			NOP
+		NOP								SQ			VF21,11(VI02)
+		FTOI15.w	VF20,VF00			NOP
+;		NOP								MFIR.w		VF20,VI10
+		NOP								SQ			VF20,13(VI02)
+		
+		;FTOI15.w	VF22,VF00			NOP
+		NOP								MFIR.w		VF22,VI00
+		NOP								SQ			VF22,15(VI02)
+		
+;		NOP								MFIR.w		VF23,VI12
+		FTOI15.w	VF23,VF00			NOP
+		NOP								SQ			VF23,17(VI02)
+;		NOP								MFIR.w		VF25,VI12
+		FTOI15.w	VF25,VF00			NOP
+		NOP								SQ			VF25,19(VI02)
+
+
+		
+		; backface testing and colours (8 tests)
+		NOP								IADDIU		VI10,VI00,0x10
+		NOP								IADDIU		VI11,VI00,0x08
+		
+		; 215
+		SUB.xyz		VF01,VF22,VF21		NOP
+		SUB.xyz		VF02,VF25,VF21		NOP
+		OPMULA.xyz	ACC,VF01,VF02		NOP
+		OPMSUB.xyz	VF03,VF02,VF01		MOVE		VF01,VF02
+		MULz.w		VF00,VF00,VF03z		MOVE		VF01,VF02
+		;NOP								NOP
+		;NOP								NOP
+		;NOP								NOP
+		FTOI0		VF02,VF01			FMAND		VI01,VI10
+		NOP								ISUB		VI01,VI01,VI11
+		NOP								ISW.xyzw	VI01,4(VI02)
+		
+		; 145
+		SUB.xyz		VF01,VF21,VF24		NOP
+		SUB.xyz		VF02,VF25,VF24		NOP
+		OPMULA.xyz	ACC,VF01,VF02		NOP
+		OPMSUB.xyz	VF03,VF02,VF01		MOVE		VF01,VF02
+		MULz.w		VF00,VF00,VF03z		MOVE		VF01,VF02
+		;NOP								NOP
+		;NOP								NOP
+		;NOP								NOP
+		FTOI0		VF02,VF01			FMAND		VI01,VI10
+		NOP								ISUB		VI01,VI01,VI11
+		NOP								ISW.xyzw	VI01,6(VI02)
+		
+		; 543
+		SUB.xyz		VF01,VF25,VF24		NOP
+		SUB.xyz		VF02,VF23,VF24		NOP
+		OPMULA.xyz	ACC,VF01,VF02		NOP
+		OPMSUB.xyz	VF03,VF02,VF01		MOVE		VF01,VF02
+		MULz.w		VF00,VF00,VF03z		MOVE		VF01,VF02
+		;NOP								NOP
+		;NOP								NOP
+		;NOP								NOP
+		FTOI0		VF02,VF01			FMAND		VI01,VI10
+		NOP								ISUB		VI01,VI01,VI11
+		NOP								ISW.xyzw	VI01,8(VI02)
+		
+		; 134
+		SUB.xyz		VF01,VF21,VF23		NOP
+		SUB.xyz		VF02,VF24,VF23		NOP
+		OPMULA.xyz	ACC,VF01,VF02		NOP
+		OPMSUB.xyz	VF03,VF02,VF01		MOVE		VF01,VF02
+		MULz.w		VF00,VF00,VF03z		MOVE		VF01,VF02
+		;NOP								NOP
+		;NOP								NOP
+		;NOP								NOP
+		FTOI0		VF02,VF01			FMAND		VI01,VI10
+		NOP								ISUB		VI01,VI01,VI11
+		NOP								ISW.xyzw	VI01,10(VI02)
+		
+		; 103
+		SUB.xyz		VF01,VF21,VF20		NOP
+		SUB.xyz		VF02,VF23,VF20		NOP
+		OPMULA.xyz	ACC,VF01,VF02		NOP
+		OPMSUB.xyz	VF03,VF02,VF01		MOVE		VF01,VF02
+		MULz.w		VF00,VF00,VF03z		MOVE		VF01,VF02
+		;NOP								NOP
+		;NOP								NOP
+		;NOP								NOP
+		FTOI0		VF02,VF01			FMAND		VI01,VI10
+		NOP								ISUB		VI01,VI01,VI11
+		NOP								ISW.xyzw	VI01,12(VI02)
+		
+		; 012
+		SUB.xyz		VF01,VF20,VF21		NOP
+		SUB.xyz		VF02,VF22,VF21		NOP
+		OPMULA.xyz	ACC,VF01,VF02		NOP
+		OPMSUB.xyz	VF03,VF02,VF01		MOVE		VF01,VF02
+		MULz.w		VF00,VF00,VF03z		MOVE		VF01,VF02
+		;NOP								NOP
+		;NOP								NOP
+		;NOP								NOP
+		FTOI0		VF02,VF01			FMAND		VI01,VI10
+		NOP								ISUB		VI01,VI01,VI11
+		NOP								ISW.xyzw	VI01,14(VI02)
+		
+		; 023
+		SUB.xyz		VF01,VF20,VF22		NOP
+		SUB.xyz		VF02,VF23,VF22		NOP
+		OPMULA.xyz	ACC,VF01,VF02		NOP
+		OPMSUB.xyz	VF03,VF02,VF01		MOVE		VF01,VF02
+		MULz.w		VF00,VF00,VF03z		MOVE		VF01,VF02
+		;NOP								NOP
+		;NOP								NOP
+		;NOP								NOP
+		FTOI0		VF02,VF01			FMAND		VI01,VI10
+		NOP								ISUB		VI01,VI01,VI11
+		NOP								ISW.xyzw	VI01,16(VI02)
+
+		; 253
+		SUB.xyz		VF01,VF22,VF25		NOP
+		SUB.xyz		VF02,VF23,VF25		NOP
+		OPMULA.xyz	ACC,VF01,VF02		NOP
+		OPMSUB.xyz	VF03,VF02,VF01		MOVE		VF01,VF02
+		MULz.w		VF00,VF00,VF03z		MOVE		VF01,VF02
+		;NOP								NOP
+		;NOP								NOP
+		;NOP								NOP
+		FTOI0		VF02,VF01			FMAND		VI01,VI10
+		NOP								ISUB		VI01,VI01,VI11
+		NOP								ISW.xyz		VI01,18(VI02)
+
+NextPrism:		
+		; loop control
+		NOP								IADDIU		VI02,VI02,20
+		NOP								NOP
+
+
+		.endif
+
+
+
+;-----------------------------------------------------------------------------------------------------------------------------
+; clip triangle if not already culled and if part of it may be in the view frustum and another part in the outer frustum
+; i.e. if clip if (ADC==0 && viewAND==0 && outerOR!=0)
+
+; ADC bit should be set for any of the following:
+;  - ADC set already
+;  - outerOR!=0 (i.e. if culling renderer would cull it)
+;  - viewAND!=0 (trivial rejection)
+
+Clip:
+
+		; reconstruct world-to-frustum transform
+		MULA		ACC,VF10,VF12		NOP
+		MADDw		VF04,VF11,VF12w		NOP
+		MULA		ACC,VF10,VF13		NOP
+		MADDw		VF05,VF11,VF13w		NOP
+		MULA		ACC,VF10,VF14		NOP
+		MADDw		VF06,VF11,VF14w		NOP
+		MULA		ACC,VF10,VF15		NOP
+		MADDw		VF07,VF11,VF15w		NOP
+		
+		.if 0
+		;---------------------------------------------------------
+		.if 0
+		; optimised version
+		
+		; loop prologue
+		NOP								IADD		VI03,VI02,VI04
+		ADDAx		ACC,VF07,VF00x		LQ			VF01,-1(VI03)
+		ITOF4.xyz	VF02,VF01			NOP
+		MADDAx		ACC,VF04,VF02x		NOP
+		MADDAy		ACC,VF05,VF02y		NOP
+		MADDz		VF03,VF06,VF02z		NOP
+		CLIPw.xyz	VF03xyz,VF03w		IADDIU		VI10,VI00,0
+		
+		; main clip-testing loop
+LoopC:	ADDAw.xyz	ACC,VF00,VF03w		MTIR		VI07,VF01w
+		MULAw.w		ACC,VF03,VF00w		IADD		VI03,VI03,VI04
+		MADDAz.x	ACC,VF03,VF09z		LQ			VF01,-1(VI03)
+		MADDAw.y	ACC,VF03,VF09w		FCOR		VI01,0xFEFBEF
+		MSUBAx.z	ACC,VF09,VF03x		ISUB		VI07,VI07,VI01
+		MSUBAy.w	ACC,VF09,VF03y		FCOR		VI01,0xFDF7DF
+		ITOF4.xyz	VF02,VF01			ISUB		VI07,VI07,VI01
+		MADDx		VF00,VF00,VF00x		FCAND		VI01,0x03FFFF
+		NOP								ISUB		VI07,VI07,VI01
+		ADDAx		ACC,VF07,VF00x		IADD		VI02,VI02,VI04
+		MADDAx		ACC,VF04,VF02x		IAND		VI08,VI10,VI11
+		MADDAy		ACC,VF05,VF02y		IADDIU		VI11,VI10,0
+		MADDz		VF03,VF06,VF02z		FMOR		VI10,VI00
+		NOP								IAND		VI01,VI08,VI10
+		NOP								ISUB		VI07,VI07,VI01
+		NOP								IBNE		VI02,VI05,LoopC
+		CLIPw.xyz	VF03xyz,VF03w		ISW.w		VI07,-1(VI02)
+		
+		;---------------------------------------------------------
+		.else
+		; unoptimised version
+
+		; initialise source pointer
+		NOP								IADDIU		VI03,VI02,0
+		
+LoopC:
+		; step source pointer
+		NOP								IADD		VI03,VI03,VI04
+		
+		; load vertex
+		NOP								LQ			VF01,-1(VI03)
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		
+		; convert to float
+		ITOF4.xyz	VF02,VF01			NOP
+		
+		; get ADC field
+		NOP								MTIR		VI07,VF01w
+		
+		; transform to outer volume
+		ADDAx		ACC,VF07,VF00x		NOP
+		MADDAx		ACC,VF04,VF02x		NOP
+		MADDAy		ACC,VF05,VF02y		NOP
+		MADDz		VF03,VF06,VF02z		NOP
+		
+		; step destination pointer
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								NOP
+		
+		; generate clip codes
+		CLIPw.xyz	VF03xyz,VF03w		NOP
+
+		; generate pre-AND and advance outcode queue
+		NOP								IAND		VI08,VI10,VI11
+		NOP								IADDIU		VI11,VI10,0
+		NOP								NOP
+		
+		; generate view-AND.z, combine with ADC
+		NOP								FCOR		VI01,0xFEFBEF		; near
+		NOP								ISUB		VI07,VI07,VI01
+		NOP								FCOR		VI01,0xFDF7DF		; far
+		NOP								ISUB		VI07,VI07,VI01
+		
+		; get outer-OR.xyz, combine with ADC
+		NOP								FCAND		VI01,0x03FFFF
+		NOP								ISUB		VI07,VI07,VI01
+
+		; generate flags for view-AND.xy
+		ADDAw.xyz	ACC,VF00,VF03w		NOP
+		MULAw.w		ACC,VF03,VF00w		NOP
+		MADDAz.x	ACC,VF03,VF09z		NOP
+		MADDAw.y	ACC,VF03,VF09w		NOP
+		MSUBAx.z	ACC,VF09,VF03x		NOP
+		MSUBAy.w	ACC,VF09,VF03y		NOP
+		MADDx		VF00,VF00,VF00x		NOP			; result is (w+Sx*x,w+Sy*y,w-Sx*x,w-Sy*y)
+		
+		; get flags for view-AND.xy
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								FMOR		VI10,VI00
+		
+		; generate view-AND.xy, combine with ADC
+		NOP								IAND		VI01,VI08,VI10
+		NOP								ISUB		VI07,VI07,VI01
+		
+		; store computed w component
+		NOP								ISW.w		VI07,-1(VI02)
+		
+		; loop control
+		NOP								IBNE		VI02,VI05,LoopC
+		NOP								NOP
+		
+		.endif
+		;---------------------------------------------------------
+		.else
+		; backface cull version
+		
+		.if 0
+		; unoptimised version
+		
+		; initialise source pointer
+		NOP								IADDIU		VI03,VI02,0
+		
+		; set ADC mask
+		NOP								IADDIU		VI09,VI00,0x4000
+		NOP								IADDIU		VI09,VI09,0x4000
+		
+LoopC:
+		; step source pointer
+		NOP								IADD		VI03,VI03,VI04
+		
+		; load vertex
+		NOP								LQ			VF01,-1(VI03)
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		
+		; convert to float
+		ITOF4.xyz	VF02,VF01			NOP
+		
+		; get ADC field
+		NOP								MTIR		VI14,VF01w
+		NOP								IAND		VI07,VI14,VI09
+		
+		; transform to outer volume
+		ADDAx		ACC,VF07,VF00x		NOP
+		MADDAx		ACC,VF04,VF02x		NOP
+		MADDAy		ACC,VF05,VF02y		NOP
+		MADDz		VF03,VF06,VF02z		NOP
+		
+		; step destination pointer
+		NOP								IADD		VI02,VI02,VI04
+		NOP								NOP
+		NOP								NOP
+		
+		; generate clip codes
+		CLIPw.xyz	VF03xyz,VF03w		NOP
+
+		; generate pre-AND and advance outcode queue
+		NOP								IAND		VI08,VI10,VI11
+		NOP								IADDIU		VI11,VI10,0
+		NOP								NOP
+		
+		; generate view-AND.z, combine with ADC
+		NOP								FCOR		VI01,0xFEFBEF		; near
+		NOP								ISUB		VI07,VI07,VI01
+		NOP								FCOR		VI01,0xFDF7DF		; far
+		NOP								ISUB		VI07,VI07,VI01
+		
+		; get outer-OR.xyz, combine with ADC
+		NOP								FCAND		VI01,0x03FFFF
+		NOP								ISUB		VI07,VI07,VI01
+
+		; generate flags for view-AND.xy
+		ADDAw.xyz	ACC,VF00,VF03w		NOP
+		MULAw.w		ACC,VF03,VF00w		NOP
+		MADDAz.x	ACC,VF03,VF09z		NOP
+		MADDAw.y	ACC,VF03,VF09w		NOP
+		MSUBAx.z	ACC,VF09,VF03x		NOP
+		MSUBAy.w	ACC,VF09,VF03y		NOP
+		MADDx		VF00,VF00,VF00x		NOP			; result is (w+Sx*x,w+Sy*y,w-Sx*x,w-Sy*y)
+		
+		; get flags for view-AND.xy
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								FMOR		VI10,VI00
+		
+		; inc by 1
+		NOP								IADDIU		VI07,VI07,1
+		
+		; generate view-AND.xy, combine with ADC
+		NOP								IAND		VI01,VI08,VI10
+		NOP								ISUB		VI07,VI07,VI01
+		
+		; will it be clipped?
+		NOP								NOP
+		NOP								IBNE		VI07,VI00,WontBeClipped
+		NOP								NOP
+		
+		; set both adc and clip-bit (0x4000)
+		NOP								ISUBIU		VI01,VI14,0x4000
+		NOP								ISW.w		VI01,-1(VI02)
+WontBeClipped:
+		
+		; loop control
+		NOP								IBNE		VI02,VI05,LoopC
+		NOP								NOP
+		
+		.else
+		; optimised version
+		;
+		
+		; loop prologue
+		NOP								IADD		VI03,VI02,VI04
+		ADDAx		ACC,VF07,VF00x		LQ			VF01,-1(VI03)
+		ITOF4.xyz	VF02,VF01			IADDIU		VI09,VI00,0x4000
+		MADDAx		ACC,VF04,VF02x		IADDIU		VI09,VI09,0x4000
+		MADDAy		ACC,VF05,VF02y		NOP
+		MADDz		VF03,VF06,VF02z		NOP
+		
+		; main clip-testing loop
+LoopC:	NOP								IBEQ		VI02,VI05,AllClipped
+		CLIPw.xyz	VF03xyz,VF03w		MTIR		VI14,VF01w
+		ADDAw.xyz	ACC,VF00,VF03w		IAND		VI07,VI14,VI09
+		MULAw.w		ACC,VF03,VF00w		IADD		VI03,VI03,VI04
+		MADDAz.x	ACC,VF03,VF09z		LQ			VF01,-1(VI03)
+		MADDAw.y	ACC,VF03,VF09w		FCOR		VI01,0xFEFBEF
+		MSUBAx.z	ACC,VF09,VF03x		ISUB		VI07,VI07,VI01
+		MSUBAy.w	ACC,VF09,VF03y		FCOR		VI01,0xFDF7DF
+		ITOF4.xyz	VF02,VF01			ISUB		VI07,VI07,VI01
+		MADDx		VF00,VF00,VF00x		FCAND		VI01,0x03FFFF
+		NOP								ISUB		VI07,VI07,VI01
+		ADDAx		ACC,VF07,VF00x		IADD		VI02,VI02,VI04
+		MADDAx		ACC,VF04,VF02x		IAND		VI08,VI10,VI11
+		MADDAy		ACC,VF05,VF02y		IADDIU		VI11,VI10,0
+		MADDz		VF03,VF06,VF02z		FMOR		VI10,VI00
+		NOP								IAND		VI01,VI08,VI10
+		NOP								ISUB		VI07,VI07,VI01
+		NOP								IADDIU		VI07,VI07,1
+		NOP								NOP
+		NOP								IBNE		VI07,VI00,LoopC
+		NOP								ISUBIU		VI01,VI14,0x4000
+		NOP								IBNE		VI02,VI05,LoopC
+		NOP								ISW.w		VI01,-1(VI02)
+		
+		.endif
+		.endif
+		;---------------------------------------------------------
+		
+AllClipped:
+		; reset pointer
+		NOP								ISUB		VI02,VI02,VI06
+		
+		; set the EOP bit of the previous tag
+		NOP								ILW.x		VI01,0(VI12)
+		NOP								IADDIU		VI01,VI01,0x4000
+		NOP								IADDIU		VI01,VI01,0x4000
+		NOP								ISW.x		VI01,0(VI12)
+		
+		; set fan buffer base
+		NOP								ISUBIU		VI12,VI13,288		; MAX_VU1_BUFFER - # regs to save
+		
+		; kick the context (which might be just a dummy giftag)
+		; this stalls until the GS has finished with the memory we want to use as the fan buffer
+		NOP								XGKICK		VI13
+		
+		; the fan buffer is now guaranteed not to be in use by the GS or DMAC
+		
+		; save some registers
+		NOP								SQ			VF20,-12(VI12)
+		NOP								SQ			VF21,-11(VI12)
+		NOP								SQ			VF22,-10(VI12)
+		NOP								SQ			VF23,-9(VI12)
+		NOP								SQ			VF24,-8(VI12)
+		NOP								SQ			VF25,-7(VI12)
+		NOP								SQ			VF26,-6(VI12)
+		NOP								SQ			VF27,-5(VI12)
+		NOP								SQ			VF28,-4(VI12)
+		NOP								SQ			VF29,-3(VI12)
+		NOP								SQ			VF30,-2(VI12)
+		NOP								SQ			VF31,-1(VI12)
+		
+		; set new giftag pointer (the preclipped tristrip)
+		NOP								ISUBIU		VI13,VI02,1
+		
+		; output pointer = fan buffer base
+		NOP								IADDIU		VI03,VI12,0
+		
+
+		; frustum planes:
+		;
+		; 0x0020 far
+		; 0x0010 near
+		; 0x0008 top
+		; 0x0004 bottom
+		; 0x0002 left
+		; 0x0001 right
+		;
+		;   1---------0
+		;   |\   3   /|
+		;   | *-----* |
+		;   | | (5) | |
+		;   |1|  4  |0|
+		;   | |     | |
+		;   | *-----* |
+		;   |/   2   \|
+		;   *---------*
+
+
+		; registers used:
+		;
+		; VF20: p[j0], m[j0]
+		; VF21: p[j1], m[j1]
+		; VF22: p[j2], m[j2]
+		; VF23: p[j3], m[j3]
+		; VF24: p[j4], m[j4]
+		; VF25: p[j5], m[j5]
+		;
+		; VF26: x[i0], o[i0]
+		; VF27: x[i1], o[i1]
+		; VF28: x[i2], o[i2]
+		;
+		; VF30: e0, flags(e0), just the w-component
+		; VF31: e1, flags(e1)
+		;
+		;
+		; VI12: fan buffer base
+
+
+		; skip the 1st 2 vertices
+		NOP								IADD		VI02,VI02,VI04
+		NOP								IADD		VI02,VI02,VI04
+		NOP								ISUB		VI01,VI02,VI05
+		NOP								IADD		VI08,VI02,VI04
+		NOP								IBGEZ		VI01,PostClip
+		NOP								ILW.w		VI01,-1(VI08)
+
+		; loop over strip, clipping the triangles that are marked with clip bit 0x4000
+ClipLoop:
+		NOP								IBEQ		VI02,VI05,KickFans
+		NOP								IADDIU		VI08,VI00,0x4000
+		NOP								IADD		VI02,VI02,VI04
+		NOP								IAND		VI08,VI01,VI08
+		NOP								IADD		VI01,VI02,VI04
+		NOP								IBEQ		VI08,VI00,ClipLoop
+		NOP								ILW.w		VI01,-1(VI01)
+
+
+		; go ahead with clipping...
+		
+
+		;-------------------------------
+		; load vertex coords from memory
+		;-------------------------------
+
+		NOP								LQ			VF07,-1(VI02)
+		NOP								ISUB		VI01,VI02,VI04
+		NOP								LQ			VF06,-1(VI01)
+		NOP								ISUB		VI01,VI01,VI04
+		NOP								LQ			VF05,-1(VI01)
+		
+		
+		;-----------------
+		; convert to float
+		;-----------------
+		
+		ITOF4.xyz	VF07,VF07			NOP
+		ITOF4.xyz	VF06,VF06			NOP
+		ITOF4.xyz	VF05,VF05			NOP
+
+		;------------------------
+		; apply frustum transform
+		;------------------------
+
+		; reconstruct world-to-frustum transform
+		MULA		ACC,VF10,VF15		NOP
+		MADDw		VF04,VF11,VF15w		NOP
+		MULA		ACC,VF10,VF12		NOP
+		MADDw		VF01,VF11,VF12w		NOP
+		MULA		ACC,VF10,VF13		NOP
+		MADDw		VF02,VF11,VF13w		NOP
+		MULA		ACC,VF10,VF14		NOP
+		MADDw		VF03,VF11,VF14w		NOP
+		
+		ADDAx		ACC,VF04,VF00x		NOP
+		MADDAx		ACC,VF01,VF05x		NOP
+		MADDAy		ACC,VF02,VF05y		NOP
+		MADDz		VF26,VF03,VF05z		NOP
+
+		ADDAx		ACC,VF04,VF00x		NOP
+		MADDAx		ACC,VF01,VF06x		NOP
+		MADDAy		ACC,VF02,VF06y		NOP
+		MADDz		VF27,VF03,VF06z		NOP
+
+		ADDAx		ACC,VF04,VF00x		NOP
+		MADDAx		ACC,VF01,VF07x		NOP
+		MADDAy		ACC,VF02,VF07y		NOP
+		MADDz		VF28,VF03,VF07z		NOP
+
+
+		; reorder the vertices
+		;
+		.if 0
+		
+		; zero the swap flags
+		NOP								IADDIU		VI10,VI00,0
+		
+		; set up mask 0x0E
+		NOP								IADDIU		VI07,VI00,0x0E
+		
+		; compare VF05 to VF06
+		MAX.xyz		VF01,VF05,VF06		NOP
+		SUB.xyz		VF00,VF05,VF06		NOP
+		NOP								NOP
+		NOP								NOP
+		SUB.xyz		VF00,VF01,VF06		NOP
+		
+		; Z
+		NOP								FMAND 		VI01,VI07
+		
+		; ~Z
+		NOP								ISUB		VI01,VI07,VI01
+		
+		; ~Z & -(~Z)
+		NOP								ISUB		VI08,VI00,VI01
+		NOP								IAND		VI01,VI01,VI08
+		
+		; (~Z & -(~Z)) & S
+		NOP								FMAND		VI01,VI01
+		NOP								IBNE		VI01,VI00,NoSwap0
+		NOP								NOP
+		
+		ADDx.xyz	VF05,VF06,VF00x		MOVE.xyz	VF06,VF05
+		ADDx		VF26,VF27,VF00x		MOVE		VF27,VF26
+		NOP								IADDIU		VI10,VI10,1
+NoSwap0:
+		
+		; compare VF05 to VF07
+		MAX.xyz		VF02,VF05,VF07		NOP
+		SUB.xyz		VF00,VF05,VF07		NOP
+		NOP								NOP
+		NOP								NOP
+		SUB.xyz		VF00,VF02,VF07		NOP
+		
+		; Z
+		NOP								FMAND 		VI01,VI07
+		
+		; ~Z
+		NOP								ISUB		VI01,VI07,VI01
+		
+		; ~Z & -(~Z)
+		NOP								ISUB		VI08,VI00,VI01
+		NOP								IAND		VI01,VI01,VI08
+		
+		; (~Z & -(~Z)) & S
+		NOP								FMAND		VI01,VI01
+		NOP								IBNE		VI01,VI00,NoSwap1
+		NOP								NOP
+		
+		ADDx.xyz	VF05,VF07,VF00x		MOVE.xyz	VF07,VF05
+		ADDx		VF26,VF28,VF00x		MOVE		VF28,VF26
+		NOP								IADDIU		VI10,VI10,2
+NoSwap1:
+		
+		; compare VF06 to VF07
+		MAX.xyz		VF03,VF06,VF07		NOP
+		SUB.xyz		VF00,VF06,VF07		NOP
+		NOP								NOP
+		NOP								NOP
+		SUB.xyz		VF00,VF03,VF07		NOP
+		
+		; Z
+		NOP								FMAND 		VI01,VI07
+		
+		; ~Z
+		NOP								ISUB		VI01,VI07,VI01
+		
+		; ~Z & -(~Z)
+		NOP								ISUB		VI08,VI00,VI01
+		NOP								IAND		VI01,VI01,VI08
+		
+		; (~Z & -(~Z)) & S
+		NOP								FMAND		VI01,VI01
+		NOP								IBNE		VI01,VI00,NoSwap2
+		NOP								NOP
+		
+		ADDx.xyz	VF06,VF07,VF00x		MOVE.xyz	VF07,VF06
+		ADDx		VF27,VF28,VF00x		MOVE		VF28,VF27
+		NOP								IADDIU		VI10,VI10,4
+NoSwap2:
+
+		; save the swap flags
+		NOP								MFIR.x		VF30,VI10
+		
+		.else
+		
+		MAX.xyz		VF01,VF05,VF06		IADDIU		VI09,VI00,0x0E		; set up mask 0x0E
+		SUB.xyz		VF00,VF05,VF06		NOP
+		MAX.xyz		VF02,VF05,VF07		NOP
+		MAX.xyz		VF03,VF06,VF07		NOP
+		NOP								NOP
+		SUB.xyz		VF00,VF01,VF06		FMAND 		VI01,VI09			; Z
+		SUB.xyz		VF00,VF05,VF07		ISUB		VI07,VI09,VI01		; ~Z
+		NOP								ISUB		VI01,VI00,VI07
+		NOP								IAND		VI07,VI07,VI01		; ~Z & -(~Z)
+		NOP								FMAND		VI07,VI07			; (~Z & -(~Z)) & S
+		SUB.xyz		VF00,VF02,VF07		FMAND 		VI01,VI09			; Z
+		SUB.xyz		VF00,VF06,VF07		ISUB		VI08,VI09,VI01		; ~Z
+		NOP								ISUB		VI01,VI00,VI08
+		NOP								IAND		VI08,VI08,VI01		; ~Z & -(~Z)
+		NOP								FMAND		VI08,VI08			; (~Z & -(~Z)) & S
+		SUB.xyz		VF00,VF03,VF07		FMAND 		VI01,VI09			; Z
+		NOP								ISUB		VI09,VI09,VI01		; ~Z
+		NOP								ISUB		VI01,VI00,VI09
+		NOP								IAND		VI09,VI09,VI01		; ~Z & -(~Z)
+		NOP								FMAND		VI09,VI09			; (~Z & -(~Z)) & S
+
+		ADDx.xyz	VF01,VF05,VF00x		IBEQ		VI07,VI00,NoSwap0
+		NOP								IADDIU		VI01,VI00,0
+		
+		ADDx.xyz	VF05,VF06,VF00x		ISUB		VI08,VI08,VI09		; swap VF05 with VF06
+		ADDx		VF26,VF27,VF00x		MOVE		VF27,VF26
+		NOP								IADD		VI09,VI08,VI09		; and swap flags VI08 with VI09
+		ADDx.xyz	VF06,VF01,VF00x		ISUB		VI08,VI09,VI08
+		NOP								IADDIU		VI01,VI01,1			; set swap flag 0
+NoSwap0:
+		NOP								IBEQ		VI08,VI00,NoSwap1
+		NOP								NOP
+		
+		ADDx.xyz	VF05,VF07,VF00x		MOVE.xyz	VF07,VF05			; swap VF05 with VF07
+		ADDx		VF26,VF28,VF00x		MOVE		VF28,VF26
+		NOP								IADDIU		VI01,VI01,2			; set swap flag 1
+NoSwap1:
+		NOP								IBEQ		VI09,VI00,NoSwap2
+		NOP								NOP
+		
+		ADDx.xyz	VF06,VF07,VF00x		MOVE.xyz	VF07,VF06			; swap VF06 with VF07
+		ADDx		VF27,VF28,VF00x		MOVE		VF28,VF27
+		NOP								IADDIU		VI01,VI01,4			; set swap flag 2
+NoSwap2:
+		NOP								MFIR.x		VF30,VI01			; save the swap flags
+		
+		.endif
+		;------------------------------------------------------------------------
+		
+		
+		;--------------------------
+		; apply full view transform
+		;--------------------------
+		
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF05x		NOP
+		MADDAy		ACC,VF13,VF05y		NOP
+		MADDz		VF05,VF14,VF05z		NOP
+
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF06x		NOP
+		MADDAy		ACC,VF13,VF06y		NOP
+		MADDz		VF06,VF14,VF06z		NOP
+
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF07x		NOP
+		MADDAy		ACC,VF13,VF07y		NOP
+		MADDz		VF07,VF14,VF07z		NOP
+
+
+
+		;---------------------------
+		; classify triangle vertices
+		;---------------------------
+
+		ADDx		VF01,VF26,VF00x		BAL			VI14,ClassifyTriangleVertex
+		SUB.xyz		VF02,VF00,VF26		MR32.z		VF26,VF26
+		NOP								MFIR.w		VF26,VI01
+		
+		ADDx		VF01,VF27,VF00x		BAL			VI14,ClassifyTriangleVertex
+		SUB.xyz     VF02,VF00,VF27		MR32.z		VF27,VF27
+		NOP								MFIR.w		VF27,VI01
+		
+		ADDx		VF01,VF28,VF00x		BAL			VI14,ClassifyTriangleVertex
+		SUB.xyz     VF02,VF00,VF28		MR32.z		VF28,VF28
+		NOP								MFIR.w		VF28,VI01
+
+
+		;--------------------------
+		; classify frustum vertices
+		;--------------------------
+		
+		; in frustum coords, the 8 vertices of the frustum are
+		; FTL	( f, f, f,-f)  ->  (-1,-1,-1)	0x8000
+		; FTR	(-f, f, f,-f)  ->  ( 1,-1,-1)	0x4000
+		; FBL	( f,-f, f,-f)  ->  (-1, 1,-1)	0x2000
+		; FBR	(-f,-f, f,-f)  ->  ( 1, 1,-1)	0x1000
+		; NTL	( n, n,-n,-n)  ->  (-1,-1, 1)	0x0800
+		; NTR	(-n, n,-n,-n)  ->  ( 1,-1, 1)	0x0400
+		; NBL	( n,-n,-n,-n)  ->  (-1, 1, 1)	0x0200
+		; NBR	(-n,-n,-n,-n)  ->  ( 1, 1, 1)	0x0100
+		
+		; for point classification we can work entirely in frustum coords,
+		; using just the x,y and w of each point (which form a right-handed set)
+		
+		; calculate normal to plane of triangle	(in frustum xyw-space)
+		SUB.xyz		VF01,VF27,VF26		NOP
+		SUB.xyz		VF02,VF28,VF26		NOP
+		
+		;ADDw.xyz	VF04,VF00,VF00w		NOP								; set VF04 = (1,1,1,1)...
+		;NOP								MOVE.w		VF04,VF00
+		MAXw		VF04,VF00,VF00w		NOP
+		
+		NOP								NOP
+		OPMULA.xyz	ACC,VF02,VF01		NOP
+		OPMSUB.xyz	VF01,VF01,VF02		NOP
+		
+		SUBA		ACC,VF00,VF00		NOP
+		
+		; set VF03 = (nx*x0, ny*y0, nz*w0, ?)
+		MUL.xyz		VF03,VF01,VF26		NOP
+		
+		; set VF01 = (nx+ny-nz, -nx+ny-nz, nx-ny-nz, -nx-ny-nz)
+		MADDAx.xz	ACC,VF04,VF01x		NOP
+		MSUBAx.yw	ACC,VF04,VF01x		NOP
+		MADDAy.xy	ACC,VF04,VF01y		NOP
+		MSUBAy.zw	ACC,VF04,VF01y		NOP
+		MSUBz		VF01,VF04,VF01z		NOP
+		
+		; set ACC = (n.x0, n.x0, n.x0, n.x0)
+		MULAx		ACC,VF04,VF03x		NOP
+		MADDAy		ACC,VF04,VF03y		NOP
+		MADDAz		ACC,VF04,VF03z		NOP
+		
+		; calculate (n.x0) - far * VF01
+		MSUBy		VF00,VF01,VF09y		NOP
+		
+		; calculate (n.x0) - near * VF01
+		MSUBx		VF00,VF01,VF09x		NOP
+		
+		; classify 8 vertices of frustum wrt plane of triangle
+		ADDx.x		VF01,VF00,VF28x		IADDIU		VI08,VI00,0x0F10
+		ADDx.y		VF01,VF00,VF26x		IADDIU		VI01,VI00,0x00F0	; Sxyzw MAC flags
+		ADDx.z		VF01,VF00,VF27x		FMAND		VI10,VI01
+		ADDz.x		VF03,VF00,VF28z		FMAND		VI01,VI01
+		ADDz.y		VF03,VF00,VF26z		IADD		VI10,VI10,VI10
+		ADDz.z		VF03,VF00,VF27z		IADD		VI10,VI10,VI10
+        ADDy.x		VF02,VF00,VF28y		IADD		VI10,VI10,VI10
+		ADDy.y		VF02,VF00,VF26y		IADD		VI10,VI10,VI10
+		ADDy.z		VF02,VF00,VF27y		IOR			VI10,VI10,VI01
+
+
+		; frustum outcodes now in VI10
+
+
+		;------------------------------------
+		; trivial rejection of triangle plane
+		;------------------------------------
+		
+		SUB.w		VF01,VF00,VF00		IADDIU		VI01,VI00,0x0FF0
+		SUB.xyz		VF20,VF03,VF01		IBEQ		VI10,VI00,ClipNext	; reject if whole frustum is on '0' side of trianlge plane
+		ADD.xyz		VF21,VF03,VF01		IADDIU		VI06,VI00,0			; zero output vertex count		
+		SUB.xyz		VF22,VF03,VF02		IBEQ		VI10,VI01,ClipNext	; reject if whole frustum is on '1' side of triangle plane
+		ADD.xyz		VF23,VF03,VF02		IADD		VI10,VI10,VI10		; shift another 4 bits left
+		ADDx.xyz	VF24,VF03,VF09x		IADD		VI10,VI10,VI10
+		SUBAy.xyz	ACC,VF00,VF09y		IADD		VI10,VI10,VI10
+		MSUBw.xyz	VF25,VF03,VF00w		IADD		VI10,VI10,VI10
+		
+		;-------------------------------------------
+		; initialise frustum in standard orientation
+		;-------------------------------------------
+		
+		; VecSet(p[0],  w0-x0,  w1-x1,  w2-x2, 0),	m[0] = 0x5501;	; right
+		; VecSet(p[1],  w0+x0,  w1+x1,  w2+x2, 0),	m[1] = 0xAA02;	; left
+		; VecSet(p[2],  w0-y0,  w1-y1,  w2-y2, 0),	m[2] = 0x3304;	; bottom
+		; VecSet(p[3],  w0+y0,  w1+y1,  w2+y2, 0),	m[3] = 0xCC08;	; top
+		; VecSet(p[4],  w0+n ,  w1+n ,  w2+n , 0),	m[4] = 0x0F10;	; near
+		; VecSet(p[5], -w0-f , -w1-f , -w2-f , 0),	m[5] = 0xF020;	; far
+
+		
+		NOP								LOI			0x3F805501
+		ADDi.w		VF20,VF01,I			LOI			0x3F80AA02
+		ADDi.w		VF21,VF01,I			LOI			0x3F803304
+		ADDi.w		VF22,VF01,I			LOI			0x3F80CC08
+		ADDi.w		VF23,VF01,I			LOI			0x3F800F10
+		ADDi.w		VF24,VF01,I			LOI			0x3F80F020
+		ADDi.w		VF25,VF01,I			ISUBIU		VI11,VI00,0x0100 	; 0xFF00
+		
+
+
+		;------------------------------------------
+		; put a straddling edge in the primary face
+		;------------------------------------------
+
+		; while (((c & m[j4])==0) || ((c & m[j4])==(0xFF00 & m[j4])))
+		; {
+		;	jt=j2, j2=j5, j5=j3, j3=j4, j4=jt;
+		; }
+		
+WhileA:	NOP								IAND		VI07,VI10,VI08
+		NOP								IAND		VI01,VI11,VI08
+		NOP								IBEQ		VI07,VI00,RotateA
+		ADDx		VF01,VF22,VF00x		NOP
+		NOP								IBNE		VI01,VI07,EndWhileA
+		NOP								NOP
+RotateA:ADDx		VF22,VF25,VF00x		MTIR		VI08,VF22w
+		ADDx		VF25,VF23,VF00x		B			WhileA
+		ADDx		VF23,VF24,VF00x		MOVE		VF24,VF01
+EndWhileA:
+		
+
+		;-------------------------------------------
+		; rotate straddling edge into secondary face
+		;-------------------------------------------
+
+		; while ((c & m[j3] & m[j4]) != (m[j1] & m[j3] & m[j4]))
+		; {
+		;	jt=j2, j2=j0, j0=j3, j3=j1, j1=jt;
+		; }
+
+		NOP								MTIR		VI07,VF23w			; m[j3]
+		NOP								IAND		VI07,VI07,VI08		; m[j3] & m[j4]
+		NOP								MTIR		VI11,VF21w			; m[j1]
+
+WhileB:	NOP								IAND		VI01,VI11,VI07		; m[j1] & m[j3] & m[j4]
+		NOP								IAND		VI07,VI07,VI10		; c & m[j3] & m[j4]
+		ADDx		VF01,VF22,VF00x		NOP
+		NOP								IBEQ		VI07,VI01,EndWhileB
+		NOP								IAND		VI07,VI11,VI08
+		ADDx		VF22,VF20,VF00x		MTIR		VI11,VF22w
+		ADDx		VF20,VF23,VF00x		B			WhileB
+		ADDx		VF23,VF21,VF00x		MOVE		VF21,VF01
+EndWhileB:
+
+
+
+		;------------------------------------------------
+		; roll the frustum classifier bits into the masks
+		;------------------------------------------------
+
+		NOP								IADDIU		VI10,VI10,0xFF
+		NOP								LOI			0x4B400000			; 2^23+2^22
+		
+		NOP								MTIR		VI01,VF20w
+		NOP								IAND		VI01,VI01,VI10
+		NOP								MFIR.w		VF20,VI01
+		NOP								MTIR		VI01,VF21w
+		NOP								IAND		VI01,VI01,VI10
+		NOP								MFIR.w		VF21,VI01
+		ITOF0.w		VF20,VF20			MTIR		VI01,VF22w
+		NOP								IAND		VI01,VI01,VI10
+		NOP								MFIR.w		VF22,VI01
+		ITOF0.w		VF21,VF21			MTIR		VI01,VF23w
+		ADDi.w		VF20,VF20,I			IAND		VI01,VI01,VI10
+		NOP								MFIR.w		VF23,VI01
+		ITOF0.w		VF22,VF22			MTIR		VI01,VF24w
+		ADDi.w		VF21,VF21,I			IAND		VI01,VI01,VI10
+		NOP								MFIR.w		VF24,VI01
+		ITOF0.w		VF23,VF23			MTIR		VI01,VF25w
+		ADDi.w		VF22,VF22,I			IAND		VI01,VI01,VI10
+		NOP								MFIR.w		VF25,VI01
+		ITOF0.w		VF24,VF24			NOP
+		ADDi.w		VF23,VF23,I			NOP
+		ITOF0.w		VF25,VF25			NOP
+		ADDi.w		VF24,VF24,I			NOP
+		ADDi.w		VF25,VF25,I			NOP
+		
+		
+
+		;----------------------------------------------
+		; classify initial straddling edge wrt triangle
+		;----------------------------------------------
+		
+		OPMULA.xyz	ACC,VF23,VF24		NOP
+		OPMSUB.xyz	VF31,VF24,VF23		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								IADDIU		VI01,VI00,0x00E0	; Sxyz MAC flags
+		NOP								FMAND		VI01,VI01
+		NOP								MFIR.w		VF31,VI01
+
+		; advance one face to fill the classification queue
+		NOP								BAL			VI14,NextFrustumFace
+		NOP								NOP
+
+
+; ; GENERAL ALGORITHM
+;
+; ; mark our place in the triangle
+; vT0 = vT;
+;
+; ; are we starting at a triangle vertex inside the frustum?
+; if (vT inside F)
+;	goto vTinsideF;
+;
+; ; find the first edge of the frustum poly with respect to which which the triangle vertex is out
+; while (vT outside edge(vF,vF->next))
+;	vF = vF->next;
+; while (vT inside edge(vF,vF->next))
+;	vF = vF->next;
+;
+; ; mark our place in the frustum poly
+; vF0 = vF;
+;
+; ; find an intersection, or determine there isn't one and quit
+; while (1)
+; {
+;	while (vT->next outside edge(vF,vF->next))
+;		vT = vT->next;
+;
+;	do
+;	{
+;		if ( vF        inside edge(vT,vT->next) &&
+;		     vF->next outside edge(vT,vT->next) &&
+;		     vT       outside edge(vF,vF->next))
+;		    goto Intersection;
+;		vF = vF->next;
+;		if (vF == vF0)
+;			goto Reject;
+;	}
+;	while (vT->next inside edge(vF,vF->next));
+; }
+;
+; Intersection:
+;
+; while (1)
+; {
+;
+;	Output(Intersection(edge(vF,vF->next), edge(vT,vT->next));
+;
+;	while (vT->next inside F)
+;	{
+;		vT = vT->next;
+;		if (vT==vT0)
+;			goto Finish;
+; vTinsideF:
+;		Output(vT);
+;	}
+;
+;	do {
+;		vF = vF->next;
+;	} while ((vF inside edge(vT,vT->next)) || (vF->next outside edge(vT,vT->next)));
+;
+;	Output(Intersection(edge(vT,vT->next), edge(vF,vF->next));
+;
+;	while (vF->next inside T)
+;	{
+;		vF = vF->next;
+;		Output(vF);
+;	}
+;
+;	do {
+;		vT = vT->next;
+;		if (vT==vT0)
+;			goto Finish;
+;	} while ((vT inside edge(vF,vF->next)) || (vT->next outside edge(vF,vF->next)));
+;
+; }
+;
+; Finish:
+
+		; are we starting at an in-vertex?
+		NOP								MTIR		VI07,VF26w
+		NOP								IADDIU		VI10,VI00,0x80		; mark our place in the triangle
+		NOP								IBEQ		VI07,VI00,StartIn
+		NOP								NOP
+
+		; find the first edge of the frustum poly with respect to which which the triangle vertex is out
+FindEdge1:
+		NOP								MTIR		VI01,VF23w
+		NOP								IAND		VI01,VI01,VI07
+		NOP								NOP
+		NOP								IBNE		VI01,VI00,NextFrustumFace
+		NOP								IADDIU		VI14,VI00,FindEdge1
+
+FindEdge2:
+		NOP								MTIR		VI01,VF23w
+		NOP								IAND		VI01,VI01,VI07
+		NOP								NOP
+		NOP								IBEQ		VI01,VI00,NextFrustumFace
+		NOP								IADDIU		VI14,VI00,FindEdge2
+
+		; mark our place in the frustum poly
+		NOP								MTIR		VI11,VF23w
+		NOP								MTIR		VI07,VF23w
+
+		; find an intersection, or determine there isn't one and quit
+FindIntersection:
+		NOP								MTIR		VI08,VF27w
+		NOP								IAND		VI01,VI08,VI07
+		NOP								NOP
+		NOP								IBNE		VI01,VI00,NextTriangleVertex
+		NOP								IADDIU		VI14,VI00,FindIntersection
+
+While3:
+		NOP								MTIR		VI01,VF26w
+		NOP								IAND		VI01,VI01,VI07
+		NOP								MTIR		VI07,VF31w
+		NOP								IBEQ		VI01,VI00,NoIntersectionYet
+		NOP								MTIR		VI01,VF30w
+		
+		NOP								IAND		VI01,VI01,VI10
+		NOP								IAND		VI07,VI07,VI10
+		NOP								ISUB		VI01,VI01,VI07
+		NOP								NOP
+		NOP								IBLTZ		VI01,While4
+		NOP								NOP
+		
+NoIntersectionYet:
+		
+		NOP								BAL			VI14,NextFrustumFace
+		NOP								NOP
+		NOP								MTIR		VI07,VF23w
+		NOP								IAND		VI01,VI08,VI07
+		NOP								IBEQ		VI07,VI11,ClipNext	; reject
+		NOP								NOP
+		
+		NOP								IBNE		VI01,VI00,FindIntersection
+		NOP								NOP
+
+		NOP								B			While3
+		NOP								NOP
+
+
+
+
+
+
+
+
+
+
+
+While4:	; output entering intersection
+		NOP								BAL			VI14,OutputType2
+		NOP								NOP
+
+		; output any vertices of triangle inside frustum
+OutputTriVerts:
+		NOP								MTIR		VI01,VF27w
+		NOP								NOP
+		NOP								IBNE		VI01,VI00,EndOutputTriVerts
+		NOP								NOP
+
+		NOP								BAL			VI14,NextTriangleVertex
+		NOP								NOP
+		
+StartIn:NOP								B			OutputType1
+		NOP								IADDIU		VI14,VI00,OutputTriVerts
+EndOutputTriVerts:
+
+		; traverse frustum poly to find leaving intersection
+		
+		NOP								MTIR		VI01,VF31w
+		
+FindLeavingIntersection:
+		NOP								BAL			VI14,NextFrustumFace
+		NOP								IAND		VI07,VI01,VI10
+		NOP								IAND		VI01,VI01,VI10
+		NOP								ISUB		VI09,VI07,VI01
+		NOP								NOP
+		NOP								IBLEZ		VI09,FindLeavingIntersection
+		NOP								NOP
+		
+		; output leaving intersection
+		NOP								BAL			VI14,OutputType2
+		NOP								NOP
+		
+		NOP								MTIR		VI01,VF31w
+		NOP								NOP
+		
+		; output any vertices of frustum poly inside triangle
+OutputFrustumVerts:
+
+		NOP								IBNE		VI01,VI00,EndOutputFrustumVerts
+		NOP								NOP
+		
+		NOP								BAL			VI14,OutputType3
+		NOP								NOP
+		
+		NOP								B			NextFrustumFace
+		NOP								IADDIU		VI14,VI00,OutputFrustumVerts
+EndOutputFrustumVerts:
+
+		; traverse triangle to find entering intersection
+		NOP								MTIR		VI09,VF23w
+		NOP								MTIR		VI07,VF27w
+		NOP								IAND		VI07,VI07,VI09
+
+FindEnteringIntersection:
+		NOP								IADDIU		VI01,VI07,0
+		NOP								MTIR		VI07,VF28w
+		NOP								IAND		VI07,VI07,VI09
+		NOP								BAL			VI14,NextTriangleVertex
+		NOP								ISUB		VI01,VI01,VI07
+		
+		NOP								IBLEZ		VI01,FindEnteringIntersection
+		NOP								NOP
+		
+		NOP								B			While4
+		NOP								NOP
+
+
+
+		;------------------------------------
+		; classify triangle vertex subroutine
+		;------------------------------------
+		
+		
+		; classify a triangle vertex with respect to the 6 planes of the frustum
+		; this info could possibly be retained from pass 1
+		
+ClassifyTriangleVertex:
+
+		NOP								IADDIU		VI01,VI00,0x0010	; Sw MAC flag
+		CLIPw.xyz	VF01,VF01w			FMAND		VI01,VI01
+		CLIPw.xyz	VF02,VF01w			NOP
+		NOP								IADDIU		VI07,VI00,0x003F
+		NOP								IBEQ		VI01,VI00,wPos
+		NOP								FCGET		VI01
+		NOP								FCGET		VI01
+		NOP								ISUB		VI01,VI07,VI01
+wPos:	NOP								JR			VI14
+		NOP								IAND		VI01,VI01,VI07
+		
+
+		;--------------------------------
+		; next triangle vertex subroutine
+		;--------------------------------
+
+;NextTriangleVertex()
+;{
+;	it=i0, i0=i1, i1=i2, i2=it;
+;}
+
+NextTriangleVertex:
+
+		NOP								ISUBIU		VI10,VI10,0x30
+		NOP								MOVE		VF01,VF26
+		NOP								IBLTZ		VI10,ProcessFan
+		NOP								MOVE		VF26,VF27
+		NOP								MOVE		VF27,VF28
+		NOP								JR			VI14
+		NOP								MOVE		VF28,VF01
+		
+
+		;-----------------------------
+		; next frustum face subroutine
+		;-----------------------------
+		
+
+;   1---------0
+;   |\   3   /|
+;   | *-----* |
+;   | | (5) | |
+;   |1|  4  |0|
+;   | |     | |
+;   | *-----* |
+;   |/   2   \|
+;   *---------*
+;
+;NextFrustumFace()
+;{
+;	; advance edge classification queue
+;	e0 = e1;
+;
+;	; rotate frustum in 1 of 3 ways
+;	jt=j3, j3=j4;
+;	if (m[j4] & m[j0])
+;		j4=j0, j0=jt, jt=j1, j1=j2;
+;	else if (m[j4] & m[j2])
+;		j4=j2;
+;	else
+;		j4=j1, j1=jt, jt=j0, j0=j2;
+;	j2=j5, j5=jt;
+;
+;	; classify new straddling edge wrt triangle
+;	CrossProduct(e1, p[j2], p[j4]);
+;}
+
+
+NextFrustumFace:
+
+		ADDx		VF01,VF23,VF00x		MTIR		VI09,VF24w
+		ADDx		VF23,VF24,VF00x		MTIR		VI01,VF20w
+		NOP								IAND		VI01,VI09,VI01
+		NOP								MOVE.w		VF30,VF31
+		NOP								IBEQ		VI01,VI00,NFF1
+		NOP								MTIR		VI01,VF22w
+		
+		OPMULA.xyz	ACC,VF23,VF20		MOVE		VF24,VF20
+		OPMSUB.xyz	VF31,VF20,VF23		MOVE		VF20,VF01
+		ADDx		VF01,VF21,VF00x		B			NFF3
+		ADDx		VF21,VF22,VF00x		IADDIU		VI01,VI00,0x00E0	; Sxyz MAC flags
+
+NFF1:	NOP								IAND		VI01,VI09,VI01
+		NOP								NOP
+		NOP								IBNE		VI01,VI00,NFF2
+		NOP								IADDIU		VI01,VI00,0x00E0	; Sxyz MAC flags
+
+		OPMULA.xyz	ACC,VF23,VF21		MOVE		VF24,VF21
+		OPMSUB.xyz	VF31,VF21,VF23		MOVE		VF21,VF01
+		ADDx		VF01,VF20,VF00x		B			NFF3
+		ADDx		VF20,VF22,VF00x		NOP
+
+NFF2:	OPMULA.xyz	ACC,VF23,VF22		MOVE		VF24,VF22
+		OPMSUB.xyz	VF31,VF22,VF23		NOP
+
+NFF3:	ADDx		VF00,VF31,VF00x		FMAND		VI01,VI01
+		ADDx		VF22,VF25,VF00x		JR			VI14
+		ADDx		VF25,VF01,VF00x		MFIR.w		VF31,VI01
+
+
+		;--------------------------
+		; vertex output subroutines
+		;--------------------------
+
+
+OutputWeightsFromAcc:
+
+		MADDx		VF01,VF00,VF00x		NOP
+
+OutputWeights:
+
+		NOP								IADDIU		VI06,VI06,1
+		NOP								IADDIU		VI03,VI03,3
+		NOP								JR			VI14
+		NOP								SQ			VF01,-2(VI03)
+		
+
+
+
+OutputType1:
+
+		NOP								ISUBIU		VI01,VI10,0x50
+		NOP								NOP
+		ADDw.y		VF01,VF00,VF00w		IBEQ		VI01,VI00,OutputWeights
+		ADDx.xzw	VF01,VF00,VF00x		NOP								; case i0=1 : VF01 = (0,1,0,1)
+		ADDw.z		VF01,VF00,VF00w		IBLTZ		VI01,OutputWeights
+		ADDx.xyw	VF01,VF00,VF00x		NOP								; case i0=2 : VF01 = (0,0,1,1)
+		ADDw.x		VF01,VF00,VF00w		B			OutputWeights
+		ADDx.yzw	VF01,VF00,VF00x		NOP								; case i0=0 : VF01 = (1,0,0,1)
+
+
+
+
+;OutputIntersectionType2(Vec x[3])
+;{
+;	; x = ((a0.p)x1-(a1.p)x0)/(x0-x1).p
+;	Vec Result;
+;	VecWeightedMean2(Result, -p[j4][i1], x[i0], p[j4][i0], x[i1]);
+;	Output(Result,&pClippedPoly);
+;}
+
+OutputType2:
+
+		ADDw.xyz	VF01,VF00,VF00w		ISUBIU		VI01,VI10,0x50		; VF01 = (1,1,1,?)
+		NOP								MOVE.w		VF01,VF00			; VF01 = (1,1,1,1)
+		SUBA		ACC,VF00,VF00		IBEQ		VI01,VI00,Type2B	; ACC  = (0,0,0,0)
+		NOP								NOP
+		NOP								IBLTZ		VI01,Type2C
+		NOP								NOP
+
+Type2A:	MADDAy.yw	ACC,VF01,VF23y		B			OutputWeightsFromAcc; ACC  = (0,VF23y,0,VF23y)
+		MSUBAz.xw	ACC,VF01,VF23z		NOP								; ACC  = (-VF23z,VF23y,0,VF23y-VF23z)
+		
+Type2B:	MADDAz.zw	ACC,VF01,VF23z		B			OutputWeightsFromAcc; ACC  = (0,0,VF23z,VF23z)
+		MSUBAx.yw	ACC,VF01,VF23x		NOP								; ACC  = (0,-VF23x,VF23z,VF23z-VF23x)
+		
+Type2C:	MADDAx.xw	ACC,VF01,VF23x		B			OutputWeightsFromAcc; ACC  = (VF23x,0,0,VF23x)
+		MSUBAy.zw	ACC,VF01,VF23y		NOP								; ACC  = (VF23x,0,-VF23y,VF23x-VF23y)
+
+
+
+OutputType3:
+		
+		MULAx.w		ACC,VF00,VF31x		MR32.xy		VF01,VF31
+		MADDAy.w	ACC,VF00,VF31y		NOP
+		NOP								NOP
+
+		MADDz.w		VF01,VF00,VF31z		B			OutputWeights
+		ADDx.z		VF01,VF00,VF31x		NOP								; VF01 = (VF31y, VF31z, VF31x, VF31x+VF31y+VF31z)
+		
+
+
+
+
+ProcessFan:
+
+		NOP								IBEQ		VI06,VI00,ClipNext	; if nothing was output, just forget it
+		NOP								ILW.y		VI08,0(VI13)
+
+		; get colours and texcoords from the source triangle
+		NOP								ISUB		VI01,VI02,VI04
+		NOP								ISUB		VI10,VI01,VI04
+		NOP								ISUB		VI11,VI10,VI04
+		NOP								LQ			VF23,-2(VI10)
+		NOP								LQ			VF24,-2(VI01)
+		NOP								LQ			VF25,-2(VI02)
+		NOP								LQ.xyz		VF20,0(VI11)
+		NOP								LQ.xyz		VF21,0(VI10)
+		NOP								LQ.xyz		VF22,0(VI01)
+		
+		; convert rgba to float and test for reflection mapping
+		ITOF0		VF23,VF23			ISUBIU		VI10,VI08,Refl
+		ITOF0		VF24,VF24			IADDIU		VI01,VI00,0x0FF
+		ITOF0		VF25,VF25			IAND		VI01,VI10,VI01
+		NOP								XITOP		VI11
+		NOP								IBEQ		VI01,VI00,NoConvST
+		NOP								IADDIU		VI01,VI00,SHDW
+		
+		; convert st to float and supplement with 1, and check whether it's a shadow projection
+		ITOF12.xy	VF20,VF20			IAND		VI01,VI01,VI11
+		ITOF12.xy	VF21,VF21			MR32.z		VF20,VF00
+		ITOF12.xy	VF22,VF22			IBNE		VI01,VI00,ClampedInUV
+		ADDw.z		VF21,VF00,VF00w		MR32.z		VF22,VF00
+		
+
+		; reduce texture coordinates...
+		
+		; get u-clamp flag and start floating point calculation on both coords
+		ADDw.xy		VF01,VF00,VF00w		LOI			-0.33333333
+		MULAi.xy	ACC,VF20,I			IADDIU		VI01,VI00,0x1000
+		MADDAi.xy	ACC,VF21,I			IAND		VI01,VI08,VI01
+		MADDAi.xy	ACC,VF22,I			LOI			0xCB400000	; -2^23-2^22
+		MADDAi.xy	ACC,VF01,I			IBNE		VI01,VI00,ClampedInU
+		MSUBAi.xy	ACC,VF01,I          IADDIU		VI01,VI00,0x2000
+		
+		; reduce texture coords in s
+		MADDw.x		VF20,VF20,VF00w		NOP
+		MADDw.x		VF21,VF21,VF00w		NOP
+		MADDw.x		VF22,VF22,VF00w		NOP
+		
+ClampedInU:
+
+		; get v-clamp flag
+		NOP								IAND		VI01,VI08,VI01
+		NOP								NOP
+		NOP								IBNE		VI01,VI00,ClampedInV
+		NOP								NOP
+		
+		; reduce texture coords in t
+		MADDw.y		VF20,VF20,VF00w		NOP
+		MADDw.y		VF21,VF21,VF00w		NOP
+		MADDw.y		VF22,VF22,VF00w		NOP
+		
+ClampedInV:
+ClampedInUV:
+NoConvST:
+
+
+		; get giftag and replace NLOOP, NREG and PRIM fields
+		NOP								LQ.y		VF01,0(VI13)											; VF01y = NREG:FLG:PRIM:PRE:000
+		NOP								LOI			0x53400000												; 2^39+2^38
+		ADDi.y		VF03,VF00,I			LOI			196616													; 3*2^16+8
+		ADDi.y		VF04,VF00,I			LOI			0x3F800412			; XYZ2:RGBA:STQ
+		ITOF12.y	VF01,VF01			IADDIU		VI11,VI08,0			; VF01y = float(NREG:FLG:PRIM:PRE)	; save GIFTAGy
+		SUBA.y		ACC,VF03,VF01		IADDIU		VI08,VI03,0			; ACCy = 2^39+2^38-float(NREG)		; end pointer
+		MSUBAw.y	ACC,VF03,VF00w		IADD		VI01,VI06,VI06		; ACCy = -float(NREG)				; 2 * vertex count
+		MADDAw.y	ACC,VF01,VF00w		IADD		VI01,VI01,VI06		; ACCy = float(FLG:PRIM:PRE)		; 3 * vertex count
+		MADDw.y		VF01,VF04,VF00w		ISUB		VI03,VI03,VI01		; VF01y = float(3:FLG:fanPRIM:PRE)	; address of giftag
+		NOP								MFIR.x		VF01,VI06			; EOP:NLOOP
+		ADDi.z		VF01,VF00,I			NOP
+		FTOI12.y	VF01,VF01			NOP								; VF01y = 3:FLG:fanPRIM:PRE:000
+		
+		NOP								SQ.xyz		VF01,0(VI03)
+		
+		
+		;------------------------------------------------------------------------
+		; reorder the colours and texcoords
+		.if 1
+		
+		; retrieve the swap flags
+		NOP								MTIR		VI10,VF30x
+		
+		NOP								IADDIU		VI01,VI00,1
+		NOP								IAND		VI01,VI01,VI10
+		NOP								IADDIU		VI07,VI00,2
+		NOP								IBEQ		VI01,VI00,NoSwap3
+		NOP								IAND		VI07,VI07,VI10
+		
+		ADDx		VF23,VF24,VF00x		MOVE		VF24,VF23
+		ADDx		VF20,VF21,VF00x		MOVE		VF21,VF20
+NoSwap3:
+
+		NOP								IADDIU		VI01,VI00,4
+		NOP								IBEQ		VI07,VI00,NoSwap4
+		NOP								IAND		VI01,VI01,VI10
+		
+		ADDx		VF23,VF25,VF00x		MOVE		VF25,VF23
+		ADDx		VF20,VF22,VF00x		MOVE		VF22,VF20
+NoSwap4:
+		
+		NOP								NOP
+		NOP								IBEQ		VI01,VI00,NoSwap5
+		NOP								NOP
+		
+		ADDx		VF24,VF25,VF00x		MOVE		VF25,VF24
+		ADDx		VF21,VF22,VF00x		MOVE		VF22,VF21
+NoSwap5:
+		
+		.endif
+		;------------------------------------------------------------------------
+		
+		; prepare reflection-map test
+		NOP								ISUBIU		VI11,VI10,Refl
+		NOP								IADDIU		VI01,VI00,0x0FF
+		NOP								IAND		VI11,VI11,VI01
+		
+		; fog setup
+		NOP								DIV			Q,VF00w,VF10w
+		ADDq.x		VF08,VF00,Q			WAITQ
+		
+		NOP								LOI			0x45000FFF
+		ADDi.y		VF08,VF00,I			NOP								; VF08y = 2^11 + 1 - 2^-12
+		SUBq.y		VF08,VF08,Q			NOP								; VF08y = 2^11 + 1-f0 - 2^-12
+		
+		NOP								LQ.w		VF01,-8(VI12)
+		NOP								MR32.z		VF08,VF01			; VF08 = FogNear
+		
+FanLoop:
+		NOP								LQ			VF04,1(VI03)
+		
+		MULz.w		VF08,VF04,VF08z		NOP
+		
+		MULAx		ACC,VF05,VF04x		ERCPR		P,VF04w
+		MADDAy		ACC,VF06,VF04y		NOP
+		MADDz		VF03,VF07,VF04z		IADDIU		VI01,VI00,0x0010	; Sw FMAC flag
+		
+		MULAx		ACC,VF23,VF04x		FMAND		VI01,VI01
+		MADDAy		ACC,VF24,VF04y		NOP
+		MADDz		VF02,VF25,VF04z		DIV			Q,VF08x,VF03w
+		
+		MULAx.xyz	ACC,VF20,VF04x		NOP
+		MADDAy.xyz	ACC,VF21,VF04y		NOP
+		MADDz.xyz	VF01,VF22,VF04z		LOI			1.0039				; fudgefactor to compensate for RGBA rounding error
+
+
+		NOP								IBNE		VI01,VI00,NonStandard
+		NOP								NOP
+
+		MINI.w		VF03,VF03,VF08		NOP
+
+		NOP								B			Standard
+		NOP								NOP
+
+NonStandard:
+
+		MAX.w		VF03,VF03,VF08		NOP
+
+
+Standard:
+
+		MULi		VF02,VF02,I			NOP
+		MULAy		ACC,VF00,VF08y		NOP
+		MADDq.xyzw	VF03,VF03,Q			WAITQ
+
+		
+		
+		; test for reflection mapping
+		NOP								IBNE		VI11,VI00,StandardDivST
+		NOP								LOI			8388608
+		NOP								DIV			Q,VF00w,VF01z
+		NOP								WAITQ
+		
+StandardDivST:
+		MULq.xyz	VF01,VF01,Q			NOP
+		FTOI4.xyz	VF03,VF03			WAITP
+		ADDAi.xyz	ACC,VF00,I			MFP.w		VF04,P
+		MULAi.w		ACC,VF00,I			IADDIU		VI03,VI03,3
+		MADDw		VF02,VF02,VF04w		SQ.xyz		VF01,-2(VI03)
+		NOP								SQ			VF03,0(VI03)
+		NOP								IBNE		VI03,VI08,FanLoop
+		NOP								SQ			VF02,-1(VI03)
+		
+		NOP								IADDIU		VI03,VI03,1			; add 1 for giftag
+
+
+		; temporary overflow check
+		NOP								ISUB		VI01,VI03,VI12
+		NOP								ISUBIU		VI01,VI01,263		; MAX_VU1_BUFFER - # saved regs - 25
+		NOP								NOP
+		NOP								IBGEZ		VI01,KickFans
+		NOP								NOP
+
+		
+		; go back for next triangle
+ClipNext:
+		NOP								IADD		VI01,VI02,VI04
+		NOP								IBNE		VI02,VI05,ClipLoop
+		NOP								ILW.w		VI01,-1(VI01)
+		
+
+KickFans:
+		; add a terminal giftag
+		NOP								IBEQ		VI03,VI12,PostClip
+		NOP								NOP
+		NOP								IADDIU		VI01,VI00,0x4000
+		NOP								IADDIU		VI01,VI01,0x4000
+		NOP								ISW.x		VI01,0(VI03)
+		
+		; kick the fan buffer
+		NOP								XGKICK		VI12
+		
+		; are there any more source triangles?
+		NOP								IBEQ		VI02,VI05,PostClip
+		NOP								NOP
+		
+		; stall VU till fan buffer is free
+		NOP								XGKICK		VI03
+		
+		; reset output pointer and go back for more
+		NOP								IADDIU		VI03,VI12,0
+		NOP								B			ClipNext
+		NOP								NOP
+
+PostClip:
+		; restore some registers
+		NOP								LQ			VF20,-12(VI12)
+		NOP								LQ			VF21,-11(VI12)
+		NOP								LQ			VF22,-10(VI12)
+		NOP								LQ			VF23,-9(VI12)
+		NOP								LQ			VF24,-8(VI12)
+		NOP								LQ			VF25,-7(VI12)
+		NOP								LQ			VF26,-6(VI12)
+		NOP								LQ			VF27,-5(VI12)
+		NOP								LQ			VF28,-4(VI12)
+		NOP								LQ			VF29,-3(VI12)
+		NOP								LQ			VF30,-2(VI12)
+		NOP								LQ			VF31,-1(VI12)
+		
+		; get renderer address
+		NOP								ILW.w		VI01,0(VI13)
+		
+		; reset pointer
+		NOP								IADDIU		VI02,VI13,1
+		
+		; restore render flags
+		NOP								XITOP		VI14
+		
+		; jump to postclip pass
+		NOP								JR			VI01
+		NOP								NOP
+
+
+
+
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+
+; -------------
+; PARTICLE CODE
+; -------------
+
+
+Sprites:
+
+		.if 0
+
+		NOP								IADDIU		VI03,VI02,0
+		NOP								MR32.xyz	VF08,VF00			; upper left texcoords (0,0,1)
+		ADDw.xyz	VF29,VF00,VF00w		NOP								; lower right texcoords (1,1,1)
+		NOP								MFIR.w		VF05,VI00			; clear adc bit
+		
+SpriteLoop:
+
+		NOP								IADD		VI03,VI03,VI04		; step source pointer
+		NOP								LQ			VF01,-1(VI03)		; get vertex
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF12,VF01x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF01y		NOP								; row 1 view transform
+		MADDz		VF02,VF14,VF01z		NOP								; row 2 view transform
+		MULw.xyz	VF03,VF30,VF01w		NOP								; viewport scale time size parameter
+		NOP								NOP
+		NOP								NOP
+		NOP								DIV			Q,VF00w,VF02w		; calc 1/w
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MULAq.xyz	ACC,VF02,Q			NOP								; homogeneous div
+		MSUBq.xyz	VF04,VF03,Q			NOP								; calc upper left vertex
+		MADDq.xyz	VF05,VF03,Q			NOP								; calc lower right vertex
+		NOP								NOP
+		NOP								SQ.xyz		VF29,1(VI02)		; store lower right texcoords
+		NOP								SQ			VF04,0(VI02)		; store upper left vertex
+		NOP								IADD		VI02,VI02,VI04		; step destination pointer
+		NOP								SQ			VF05,-1(VI02)		; store lower right vertex
+		NOP								IBEQ		VI02,VI05,SpriteDone; break
+		NOP								NOP
+		
+		
+		NOP								IADD		VI03,VI03,VI04		; step source pointer
+		NOP								LQ			VF01,-1(VI03)		; get vertex
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF12,VF01x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF01y		NOP								; row 1 view transform
+		MADDz		VF02,VF14,VF01z		NOP								; row 2 view transform
+		MULw.xyz	VF03,VF30,VF01w		NOP								; viewport scale time size parameter
+		NOP								NOP
+		NOP								NOP
+		NOP								DIV			Q,VF00w,VF02w		; calc 1/w
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MULAq.xyz	ACC,VF02,Q			NOP								; homogeneous div
+		MADDq.xyz	VF04,VF03,Q			NOP								; calc lower right vertex
+		MSUBq.xyz	VF05,VF03,Q			NOP								; calc upper left vertex
+		NOP								NOP
+		NOP								SQ.xyz		VF08,1(VI02)		; store upper left texcoords
+		NOP								SQ			VF04,0(VI02)		; store lower right vertex
+		NOP								IADD		VI02,VI02,VI04		; step destination pointer
+		NOP								SQ			VF05,-1(VI02)		; store upper left vertex
+		NOP								IBNE		VI02,VI05,SpriteLoop; loop
+		NOP								NOP
+		
+		
+SpriteDone:
+
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+
+		.else
+		
+		; optimised version
+
+		ADDAx		ACC,VF15,VF00x		LQ			VF03,3(VI02)
+		MADDAx		ACC,VF12,VF03x		LQ			VF01,7(VI02)
+		MADDAy		ACC,VF13,VF03y		NOP
+		MADDz		VF02,VF14,VF03z		NOP
+		MULw.xyz	VF04,VF30,VF03w		DIV			Q,VF00w,VF02w
+		ADDw.xyz	VF29,VF00,VF00w		MR32.xyz	VF08,VF00
+		ADDAx		ACC,VF15,VF00x		MFIR.w		VF04,VI00
+		MADDAx		ACC,VF12,VF01x		MFIR.w		VF05,VI00
+		MADDAy		ACC,VF13,VF01y		NOP
+		MADDz		VF03,VF14,VF01z		NOP
+		
+SpriteLoop:
+		
+		MULw.xyz	VF05,VF30,VF01w		NOP
+		MULAq.xyz	ACC,VF02,Q			IADD		VI02,VI02,VI04
+		MADDq.xyz	VF02,VF04,Q			LQ			VF01,7(VI02)
+		MSUBq.xyz	VF04,VF04,Q			DIV			Q,VF00w,VF03w
+		NOP								SQ.xyz		VF29,-3(VI02)
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF01x		SQ			VF02,-4(VI02)
+		MADDAy		ACC,VF13,VF01y		IBEQ		VI02,VI05,SpriteDone
+		MADDz		VF02,VF14,VF01z		SQ			VF04,-1(VI02)
+
+
+		MULw.xyz	VF04,VF30,VF01w		NOP
+		MULAq.xyz	ACC,VF03,Q			IADD		VI02,VI02,VI04
+		MSUBq.xyz	VF03,VF05,Q			LQ			VF01,-1(VI02)
+		MADDq.xyz	VF05,VF05,Q			DIV			Q,VF00w,VF02w
+		NOP								SQ.xyz		VF08,-3(VI02)
+		ADDAx		ACC,VF15,VF00x		NOP
+		MADDAx		ACC,VF12,VF01x		SQ			VF03,-4(VI02)
+		MADDAy		ACC,VF13,VF01y		IBNE		VI02,VI05,SpriteLoop
+		MADDz		VF03,VF14,VF01z		SQ			VF05,-1(VI02)
+		
+SpriteDone:
+
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+
+		.endif
+
+
+
+
+
+SpriteCull:
+
+		.if 0
+
+		NOP								MR32.xyz	VF08,VF00			; upper left texcoords (0,0,1)
+		ADDw.xyz	VF29,VF00,VF00w		NOP								; lower right texcoords (1,1,1)
+		
+SpriteCullLoop:
+
+		NOP								IADD		VI02,VI02,VI04
+		NOP								LQ			VF01,-1(VI02)		; get xyzr
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF12,VF01x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF01y		NOP								; row 1 view transform
+		MADDAz		ACC,VF14,VF01z		NOP								; row 2 view transform
+		MSUBw		VF02,VF31,VF01w		NOP								; 1st vertex frustum coords
+		MADDw		VF03,VF31,VF01w		NOP								; 2nd vertex frustum coords
+		NOP								NOP
+		NOP								NOP
+		MULAw		ACC,VF11,VF02w		DIV			Q,VF00w,VF02w
+		MADD		VF04,VF10,VF02		NOP								; apply viewport scale to 1st vertex
+		MADD		VF05,VF10,VF03		NOP								; apply viewport scale to 2nd vertex
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF04xyz,VF04w		NOP
+		CLIPw.xyz	VF05xyz,VF05w		NOP
+		MULq.xyz	VF02,VF02,Q			NOP
+		MULq.xyz	VF03,VF03,Q			NOP
+		NOP								SQ.xyz		VF29,-3(VI02)
+		NOP								FCAND		VI01,0x000FFF
+		NOP								IADDIU		VI01,VI01,0x7FFF
+		NOP								MFIR.w		VF03,VI01
+		NOP								SQ			VF02,-4(VI02)
+		NOP								NOP
+		NOP								IBEQ		VI02,VI05,SpriteCullDone
+		NOP								SQ			VF03,-1(VI02)
+
+
+		NOP								IADD		VI02,VI02,VI04
+		NOP								LQ			VF01,-1(VI02)		; get xyzr
+		NOP								NOP
+		NOP								NOP
+		ADDAx		ACC,VF15,VF00x		NOP								; row 3 view transform
+		MADDAx		ACC,VF12,VF01x		NOP								; row 0 view transform
+		MADDAy		ACC,VF13,VF01y		NOP								; row 1 view transform
+		MADDAz		ACC,VF14,VF01z		NOP								; row 2 view transform
+		MADDw		VF02,VF31,VF01w		NOP								; 1st vertex frustum coords
+		MSUBw		VF03,VF31,VF01w		NOP								; 2nd vertex frustum coords
+		NOP								NOP
+		NOP								NOP
+		MULAw		ACC,VF11,VF02w		DIV			Q,VF00w,VF02w
+		MADD		VF04,VF10,VF02		NOP								; apply viewport scale to 1st vertex
+		MADD		VF05,VF10,VF03		NOP								; apply viewport scale to 2nd vertex
+		NOP								NOP
+		NOP								NOP
+		CLIPw.xyz	VF04xyz,VF04w		NOP
+		CLIPw.xyz	VF05xyz,VF05w		NOP
+		MULq.xyz	VF02,VF02,Q			NOP
+		MULq.xyz	VF03,VF03,Q			NOP
+		NOP								SQ.xyz		VF08,-3(VI02)
+		NOP								FCAND		VI01,0x000FFF
+		NOP								IADDIU		VI01,VI01,0x7FFF
+		NOP								MFIR.w		VF03,VI01
+		NOP								SQ			VF02,-4(VI02)
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,SpriteCullLoop
+		NOP								SQ			VF03,-1(VI02)
+
+SpriteCullDone:
+
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+
+		.else
+
+		ADDAx		ACC,VF15,VF00x		LQ			VF01,3(VI02)
+		MADDAx		ACC,VF12,VF01x		MR32.z		VF29,VF00
+		MADDAy		ACC,VF13,VF01y		MR32.xyz	VF08,VF00
+		MADDAz		ACC,VF14,VF01z		NOP
+		MADDw		VF02,VF31,VF01w		NOP
+		MSUBw		VF03,VF31,VF01w		MR32.y		VF29,VF29
+		MULAw		ACC,VF11,VF02w		LQ			VF01,7(VI02)
+		MADD		VF06,VF10,VF02		DIV			Q,VF00w,VF02w
+		MADD		VF07,VF10,VF03		NOP
+		ADDAx		ACC,VF15,VF00x		MR32.x		VF29,VF29
+		MADDAx		ACC,VF12,VF01x		NOP
+
+SpriteCullLoop:
+
+		CLIPw.xyz	VF06xyz,VF06w		IADD		VI02,VI02,VI04
+		CLIPw.xyz	VF07xyz,VF07w		NOP
+		MADDAy		ACC,VF13,VF01y		NOP
+		MADDAz		ACC,VF14,VF01z		SQ.xyz		VF29,-3(VI02)
+		MSUBw		VF04,VF31,VF01w		NOP
+		MADDw		VF05,VF31,VF01w		FCAND		VI01,0x000FFF
+		MULq.xyz	VF02,VF02,Q			IADDIU		VI01,VI01,0x7FFF
+		MULq.xyz	VF03,VF03,Q			LQ			VF01,7(VI02)
+		MULAw		ACC,VF11,VF04w		MFIR.w		VF03,VI01
+		MADD		VF06,VF10,VF04		DIV			Q,VF00w,VF04w
+		MADD		VF07,VF10,VF05		SQ			VF02,-4(VI02)
+		ADDAx		ACC,VF15,VF00x		IBEQ		VI02,VI05,SpriteCullDone
+		MADDAx		ACC,VF12,VF01x		SQ			VF03,-1(VI02)
+
+
+		CLIPw.xyz	VF06xyz,VF06w		IADD		VI02,VI02,VI04
+		CLIPw.xyz	VF07xyz,VF07w		NOP
+		MADDAy		ACC,VF13,VF01y		NOP
+		MADDAz		ACC,VF14,VF01z		SQ.xyz		VF08,-3(VI02)
+		MADDw		VF02,VF31,VF01w		NOP
+		MSUBw		VF03,VF31,VF01w		FCAND		VI01,0x000FFF
+		MULq.xyz	VF04,VF04,Q			IADDIU		VI01,VI01,0x7FFF
+		MULq.xyz	VF05,VF05,Q			LQ			VF01,7(VI02)
+		MULAw		ACC,VF11,VF02w		MFIR.w		VF05,VI01
+		MADD		VF06,VF10,VF02		DIV			Q,VF00w,VF02w
+		MADD		VF07,VF10,VF03		SQ			VF04,-4(VI02)
+		ADDAx		ACC,VF15,VF00x		IBNE		VI02,VI05,SpriteCullLoop
+		MADDAx		ACC,VF12,VF01x		SQ			VF05,-1(VI02)
+
+SpriteCullDone:
+
+		NOP								B			NextPrim			; go back for next prim
+		NOP								LQI			VF01,(VI02++)		; prefetch next tag
+
+		.endif
+		
+
+;-----------------------------------------------------------------------------------------------------------------------------
+
+; ------------------
+; VU1 BILLBOARD CODE
+; ------------------
+
+; The most general data format for billboards:
+
+; input              output       
+; (s0,t0)            (s0,t0,1,0)   
+; (r0,g0,b0,a0)      (r0,g0,b0,a0) 
+; (x,y,z)            (X0,Y0,Z0,0)  
+; (s1,t1)            (s1,t1,1,0)   
+; (r1,g1,b1,a1)      (r1,g1,b1,a1) 
+; (w,h)              (X1,Y1,Z1,0)  
+; (s2,t2)            (s2,t2,1,0)   
+; (r2,g2,b2,a2)      (r2,g2,b2,a2) 
+; (tx,ty,ty)         (X2,Y2,Z2,0)  
+; (s3,t3)            (s3,t3,1,0)   
+; (r3,g3,b3,a3)      (r3,g3,b3,a3) 
+; (ax,ay,az)         (X3,Y3,Z3,0)  
+
+; screen aligned billboards omit the axis vector (ax,ay,az)
+; and various optimised types can omit much of the rest of the data.
+
+
+		.include "vu1/defs.vsm"
+
+
+
+
+
+		; float regs
+		.equr	Tag,	VF01
+		
+		.equr	pvw,	VF01
+		.equr	xyz0,	VF02
+		.equr	xyz1,	VF03
+		.equr	xyz2,	VF04
+		.equr	xyz3,	VF05
+		.equr	dim,	VF06
+		.equr	pvl,	VF07
+		.equr	axis,	VF08
+		.equr	wdir,	VF13
+		.equr	vdir2,	VF13
+		.equr	viewvec,VF14
+		.equr	trans,	VF15
+		.equr	stq0,	VF16
+		.equr	stq1,	VF17
+		.equr	stq2,	VF18
+		.equr	stq3,	VF19
+		
+		.equr	udir,	VF20
+		.equr	vdir,	VF21
+		.equr	vscale,	VF22
+		.equr	cam,	VF25
+		.equr	col,	VF26
+		.equr	voff,	VF27
+		.equr	matWF0,	VF28
+		.equr	matWF1,	VF29
+		.equr	matWF2,	VF30
+		.equr	matWF3,	VF31
+
+		; integer regs
+		.equr	Input,	VI02
+		.equr	Output,	VI03
+		.equr	Step,	VI04
+		.equr	End,	VI05
+		
+
+
+		.scope
+
+ScreenAlignedBillboards:
+
+		NOP								IADDIU		VI01,VI00,COLR
+		NOP								IAND		VI01,VI14,VI01
+		NOP								NOP
+		NOP								IBNE		VI01,VI00,ApplyColourBillboard
+		NOP								IADDIU		VI01,VI00,Label3
+Label3:
+
+
+		; double v basis vec
+		ADD			vdir2,vdir,vdir		NOP
+		
+		; init output pointer
+		NOP								IADDIU		Output,Input,0
+		
+@Loop:
+
+		; load geometric values
+		NOP								LQ			pvw,2(Input)
+		NOP								LQ			dim,5(Input)
+		NOP								LQ			pvl,8(Input)
+		
+		; transform world position of pivot by matWF:
+		ADDAx		ACC,matWF3,zero		NOP
+		MADDAx		ACC,matWF0,pvw.x	NOP
+		MADDAy		ACC,matWF1,pvw.y	NOP
+		MADDAz		ACC,matWF2,pvw.z	NOP
+		
+		; offset by pivot's local coords
+		MSUBAx		ACC,udir,pvl.x		NOP
+		MSUBAy		ACC,vdir,pvl.y		NOP
+		
+		; generate the 4 corners in frustum coords
+		MSUBAy		ACC,vdir,dim.y		NOP
+		MSUBx		xyz0,udir,dim.x		NOP
+		MADDx		xyz1,udir,dim.x		NOP
+		MADDAy		ACC,vdir2,dim.y		NOP
+		MSUBx		xyz2,udir,dim.x		NOP
+		MADDx		xyz3,udir,dim.x		NOP
+		
+		; culling tests
+		CLIPw.xyz	xyz0.xyz,xyz0.w		NOP
+		CLIPw.xyz	xyz1.xyz,xyz1.w		NOP
+		CLIPw.xyz	xyz2.xyz,xyz2.w		NOP
+		CLIPw.xyz	xyz3.xyz,xyz3.w		NOP
+		
+		; calc 1/w
+		NOP								DIV			Q,voff.w,xyz0.w
+		NOP								WAITQ
+		
+		; transform to homogeneous viewport coords
+		MULAw.xyz	ACC,voff,xyz0.w		NOP
+		MADD.xyz	xyz0,vscale,xyz0	NOP
+		MADD.xyz	xyz1,vscale,xyz1	NOP
+		MADD.xyz	xyz2,vscale,xyz2	NOP
+		MADD.xyz	xyz3,vscale,xyz3	NOP
+		
+		; projection
+		MULq.xyz	xyz0,xyz0,Q			NOP
+		MULq.xyz	xyz1,xyz1,Q			NOP
+		MULq.xyz	xyz2,xyz2,Q			NOP
+		MULq.xyz	xyz3,xyz3,Q			NOP
+		
+		; culling results
+		NOP								ISUBIU		VI01,VI00,1
+		NOP								MFIR.w		xyz0,VI01
+		NOP								MFIR.w		xyz1,VI01
+		NOP								FCAND		VI01,0xFFFFC0
+		NOP								IADDIU		VI01,VI01,0x7FFF
+		NOP								MFIR.w		xyz2,VI01
+		NOP								FCAND		VI01,0x03FFFF
+		NOP								IADDIU		VI01,VI01,0x7FFF
+		NOP								MFIR.w		xyz3,VI01
+		
+		; store corners
+		NOP								SQ			xyz0, 2(Output)
+		NOP								SQ			xyz1, 5(Output)
+		NOP								SQ			xyz2, 8(Output)
+		NOP								SQ			xyz3,11(Output)
+
+		; step pointers and loop
+		NOP								IADD		Input,Input,Step
+		NOP								IADD		Output,Output,Step
+		NOP								NOP
+		NOP								IBNE		Output,End,@Loop
+		NOP								NOP
+		
+		; go back for more
+		NOP								LQI			Tag,(Output++)
+		NOP								B			NextPrim
+		NOP								IADDIU		Input,Output,0
+
+		.endscope
+		
+		
+		
+		.scope
+		
+LongAxisBillboards:
+
+		NOP								IADDIU		VI01,VI00,COLR
+		NOP								IAND		VI01,VI14,VI01
+		NOP								NOP
+		NOP								IBNE		VI01,VI00,ApplyColourBillboard
+		NOP								IADDIU		VI01,VI00,Label4
+Label4:
+
+		; init output pointer
+		NOP								IADDIU		Output,Input,0
+
+@Loop:
+
+		; load geometric values
+		NOP								LQ			pvw,  2(Input)
+		NOP								LQ			dim,  5(Input)
+		NOP								LQ			pvl,  8(Input)
+		NOP								LQ			axis,11(Input)
+		
+		; get view vector in world space
+		SUB.xyz		viewvec,pvw,cam		NOP
+		
+		; generate transverse axis in world space
+		OPMULA.xyz	ACC,viewvec,axis	NOP
+		OPMSUB.xyz	trans,axis,viewvec	NOP
+		NOP								ERLENG		P,trans
+		NOP								WAITP
+		NOP								MFP.w		trans,P
+		MULw.xyz	trans,trans,trans.w	NOP
+		
+		; generate wdir
+		OPMULA.xyz	ACC,trans,axis		NOP
+		OPMSUB.xyz	wdir,axis,trans		NOP
+		
+		; transform to frustum coords
+		MULAx		ACC,matWF0,trans.x	NOP
+		MADDAy		ACC,matWF1,trans.y	NOP
+		MADDz		trans,matWF2,trans.z	NOP
+		
+		MULAx		ACC,matWF0,axis.x	NOP
+		MADDAy		ACC,matWF1,axis.y	NOP
+		MADDz		axis,matWF2,axis.z	NOP
+		
+		MULAx		ACC,matWF0,wdir.x	NOP
+		MADDAy		ACC,matWF1,wdir.y	NOP
+		MADDz		wdir,matWF2,wdir.z	NOP
+		
+		; transform world position of pivot by matWF:
+		ADDAx		ACC,matWF3,zero		NOP
+		MADDAx		ACC,matWF0,pvw.x	NOP
+		MADDAy		ACC,matWF1,pvw.y	NOP
+		MADDAz		ACC,matWF2,pvw.z	NOP
+		
+		; offset by pivot's local coords
+		MSUBAx		ACC,trans,pvl.x		NOP
+		MSUBAy		ACC,axis,pvl.y		NOP
+		MSUBAz		ACC,wdir,pvl.z		NOP
+		
+		; generate the 2 'left' corners in frustum coords
+		MSUBAx.xy	ACC,trans,dim.x		NOP
+		MSUBy		xyz0,axis,dim.y		NOP
+		MADDy		xyz2,axis,dim.y		NOP
+		
+		; generate the 2 'right' corners in frustum coords
+		MADDAx.xy	ACC,trans,dim.x		NOP
+		MADDAx.xy	ACC,trans,dim.x		NOP
+		MSUBy		xyz1,axis,dim.y		NOP
+		MADDy		xyz3,axis,dim.y		NOP
+		
+		; culling tests
+		CLIPw.xyz	xyz0.xyz,xyz0.w		NOP
+		CLIPw.xyz	xyz1.xyz,xyz1.w		NOP
+		CLIPw.xyz	xyz2.xyz,xyz2.w		NOP
+		CLIPw.xyz	xyz3.xyz,xyz3.w		NOP
+		
+		; transform to homogeneous viewport coords
+		MULAw.xyz	ACC,voff,xyz0.w		NOP
+		MADD.xyz	xyz0,vscale,xyz0	NOP
+		MADD.xyz	xyz1,vscale,xyz1	NOP
+		MULAw.xyz	ACC,voff,xyz2.w		NOP
+		MADD.xyz	xyz2,vscale,xyz2	NOP
+		MADD.xyz	xyz3,vscale,xyz3	NOP
+		
+		; load texcoords
+		NOP								LQ.xyz		stq0,0(Input)
+		NOP								LQ.xyz		stq1,3(Input)
+		NOP								LQ.xyz		stq2,6(Input)
+		NOP								LQ.xyz		stq3,9(Input)
+		
+		; homogeneous divs for 'top' corners
+		NOP								DIV			Q,voff.w,xyz0.w
+		NOP								WAITQ
+		MULq.xyz	xyz0,xyz0,Q			NOP
+		MULq.xyz	xyz1,xyz1,Q			NOP
+		MULq.xyz	stq0,stq0,Q			NOP
+		MULq.xyz	stq1,stq1,Q			NOP
+		
+		; homogeneous divs for 'bottom' corners
+		NOP								DIV			Q,voff.w,xyz2.w
+		NOP								WAITQ
+		MULq.xyz	xyz2,xyz2,Q			NOP
+		MULq.xyz	xyz3,xyz3,Q			NOP
+		MULq.xyz	stq2,stq2,Q			NOP
+		MULq.xyz	stq3,stq3,Q			NOP
+		
+		; culling results
+		NOP								ISUBIU		VI01,VI00,1
+		NOP								MFIR.w		xyz0,VI01
+		NOP								MFIR.w		xyz1,VI01
+		NOP								FCAND		VI01,0xFFFFC0
+		NOP								IADDIU		VI01,VI01,0x7FFF
+		NOP								MFIR.w		xyz2,VI01
+		NOP								FCAND		VI01,0x03FFFF
+		NOP								IADDIU		VI01,VI01,0x7FFF
+		NOP								MFIR.w		xyz3,VI01
+		
+		; store corners
+		NOP								SQ			xyz0, 2(Output)
+		NOP								SQ			xyz1, 5(Output)
+		NOP								SQ			xyz2, 8(Output)
+		NOP								SQ			xyz3,11(Output)
+
+		; store texcoords
+		NOP								SQ.xyz		stq0,0(Output)
+		NOP								SQ.xyz		stq1,3(Output)
+		NOP								SQ.xyz		stq2,6(Output)
+		NOP								SQ.xyz		stq3,9(Output)
+
+		; step pointers and loop
+		NOP								IADD		Input,Input,Step
+		NOP								IADD		Output,Output,Step
+		NOP								NOP
+		NOP								IBNE		Output,End,@Loop
+		NOP								NOP
+		
+		; go back for more
+		NOP								LQI			Tag,(Output++)
+		NOP								B			NextPrim
+		NOP								IADDIU		Input,Output,0
+
+		.endscope
+		
+		
+		
+		
+		.scope
+		
+ShortAxisBillboards:
+
+		NOP								IADDIU		VI01,VI00,COLR
+		NOP								IAND		VI01,VI14,VI01
+		NOP								NOP
+		NOP								IBNE		VI01,VI00,ApplyColourBillboard
+		NOP								IADDIU		VI01,VI00,Label5
+Label5:
+
+		; init output pointer
+		NOP								IADDIU		Output,Input,0
+
+@Loop:
+
+		; load geometric values
+		NOP								LQ			pvw,  2(Input)
+		NOP								LQ			dim,  5(Input)
+		NOP								LQ			pvl,  8(Input)
+		NOP								LQ			axis,11(Input)
+		
+		; get view vector in world space
+		SUB.xyz		viewvec,pvw,cam		NOP
+		
+		; generate transverse axis in world space
+		OPMULA.xyz	ACC,axis,viewvec	NOP
+		OPMSUB.xyz	trans,viewvec,axis	NOP
+		NOP								ERLENG		P,trans
+		NOP								WAITP
+		NOP								MFP.w		trans,P
+		MULw.xyz	trans,trans,trans.w	NOP
+		
+		; generate wdir
+		OPMULA.xyz	ACC,trans,axis		NOP
+		OPMSUB.xyz	wdir,axis,trans		NOP
+		
+		; transform to frustum coords
+		MULAx		ACC,matWF0,trans.x	NOP
+		MADDAy		ACC,matWF1,trans.y	NOP
+		MADDz		trans,matWF2,trans.z	NOP
+		
+		MULAx		ACC,matWF0,axis.x	NOP
+		MADDAy		ACC,matWF1,axis.y	NOP
+		MADDz		axis,matWF2,axis.z	NOP
+		
+		MULAx		ACC,matWF0,wdir.x	NOP
+		MADDAy		ACC,matWF1,wdir.y	NOP
+		MADDz		wdir,matWF2,wdir.z	NOP
+		
+		; transform world position of pivot by matWF:
+		ADDAx		ACC,matWF3,zero		NOP
+		MADDAx		ACC,matWF0,pvw.x	NOP
+		MADDAy		ACC,matWF1,pvw.y	NOP
+		MADDAz		ACC,matWF2,pvw.z	NOP
+		
+		; offset by pivot's local coords
+		MSUBAy		ACC,trans,pvl.y		NOP
+		MSUBAx		ACC,axis,pvl.x		NOP
+		MSUBAz		ACC,wdir,pvl.z		NOP
+		
+		; generate the 2 'left' corners in frustum coords
+		MSUBAy.xy	ACC,trans,dim.y		NOP
+		MSUBx		xyz0,axis,dim.x		NOP
+		MADDx		xyz2,axis,dim.x		NOP
+		
+		; generate the 2 'right' corners in frustum coords
+		MADDAy.xy	ACC,trans,dim.y		NOP
+		MADDAy.xy	ACC,trans,dim.y		NOP
+		MSUBx		xyz1,axis,dim.x		NOP
+		MADDx		xyz3,axis,dim.x		NOP
+		
+		; culling tests
+		CLIPw.xyz	xyz0.xyz,xyz0.w		NOP
+		CLIPw.xyz	xyz1.xyz,xyz1.w		NOP
+		CLIPw.xyz	xyz2.xyz,xyz2.w		NOP
+		CLIPw.xyz	xyz3.xyz,xyz3.w		NOP
+		
+		; transform to homogeneous viewport coords
+		MULAw.xyz	ACC,voff,xyz0.w		NOP
+		MADD.xyz	xyz0,vscale,xyz0	NOP
+		MADD.xyz	xyz1,vscale,xyz1	NOP
+		MULAw.xyz	ACC,voff,xyz2.w		NOP
+		MADD.xyz	xyz2,vscale,xyz2	NOP
+		MADD.xyz	xyz3,vscale,xyz3	NOP
+		
+		; load texcoords
+		NOP								LQ.xyz		stq0,0(Input)
+		NOP								LQ.xyz		stq1,3(Input)
+		NOP								LQ.xyz		stq2,6(Input)
+		NOP								LQ.xyz		stq3,9(Input)
+		
+		; homogeneous divs for 'top' corners
+		NOP								DIV			Q,voff.w,xyz0.w
+		NOP								WAITQ
+		MULq.xyz	xyz0,xyz0,Q			NOP
+		MULq.xyz	xyz1,xyz1,Q			NOP
+		MULq.xyz	stq0,stq0,Q			NOP
+		MULq.xyz	stq1,stq1,Q			NOP
+		
+		; homogeneous divs for 'bottom' corners
+		NOP								DIV			Q,voff.w,xyz2.w
+		NOP								WAITQ
+		MULq.xyz	xyz2,xyz2,Q			NOP
+		MULq.xyz	xyz3,xyz3,Q			NOP
+		MULq.xyz	stq2,stq2,Q			NOP
+		MULq.xyz	stq3,stq3,Q			NOP
+		
+		; culling results
+		NOP								ISUBIU		VI01,VI00,1
+		NOP								MFIR.w		xyz0,VI01
+		NOP								MFIR.w		xyz1,VI01
+		NOP								FCAND		VI01,0xFFFFC0
+		NOP								IADDIU		VI01,VI01,0x7FFF
+		NOP								MFIR.w		xyz2,VI01
+		NOP								FCAND		VI01,0x03FFFF
+		NOP								IADDIU		VI01,VI01,0x7FFF
+		NOP								MFIR.w		xyz3,VI01
+		
+		; store corners
+		NOP								SQ			xyz0, 2(Output)
+		NOP								SQ			xyz1, 5(Output)
+		NOP								SQ			xyz2, 8(Output)
+		NOP								SQ			xyz3,11(Output)
+
+		; store texcoords
+		NOP								SQ.xyz		stq0,0(Output)
+		NOP								SQ.xyz		stq1,3(Output)
+		NOP								SQ.xyz		stq2,6(Output)
+		NOP								SQ.xyz		stq3,9(Output)
+
+		; step pointers and loop
+		NOP								IADD		Input,Input,Step
+		NOP								IADD		Output,Output,Step
+		NOP								NOP
+		NOP								IBNE		Output,End,@Loop
+		NOP								NOP
+		
+		; go back for more
+		NOP								LQI			Tag,(Output++)
+		NOP								B			NextPrim
+		NOP								IADDIU		Input,Output,0
+
+		.endscope
+		
+		
+; applying material colour to a billboard
+ApplyColourBillboard:
+
+		.if 0
+		; unoptimised version
+
+		NOP								LOI			8388608
+		ADDAi		ACC,VF00,I			LOI			8388863
+		
+LoopACB:NOP								LQ.xyz		VF01,1(VI02)
+		NOP								IADDIU		VI02,VI02,3
+		NOP								NOP
+		NOP								NOP
+		ITOF0.xyz	VF02,VF01			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MADD.xyz	VF03,VF02,col		NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								NOP
+		MINIi.xyz	VF04,VF03,I			NOP
+		NOP								NOP
+		NOP								NOP
+		NOP								IBNE		VI02,VI05,LoopACB
+		NOP								SQ.xyz		VF04,-2(VI02)
+		
+		.else
+		; optimised version
+		
+		NOP								LOI			8388608
+		ADDAi		ACC,VF00,I			LQ.xyz		VF03,1(VI02)
+		ITOF0.xyz	VF03,VF03			LQ.xyz		VF02,4(VI02)
+		MADD.xyz	VF03,VF03,col		LOI			8388863
+		ITOF0.xyz	VF02,VF02			LQ.xyz		VF01,7(VI02)
+		
+LoopACB:MINIi.xyz	VF04,VF03,I			IADDIU		VI02,VI02,3
+		MADD.xyz	VF03,VF02,col		NOP
+		ITOF0.xyz	VF02,VF01			LQ.xyz		VF01,7(VI02)
+		NOP								IBNE		VI02,VI05,LoopACB
+		NOP								SQ.xyz		VF04,-2(VI02)
+		
+		.endif
+
+		NOP								JR			VI01
+		NOP								ISUB		VI02,VI02,VI06
+		
+;-----------------------------------------------------------------------------------------------------------------------------
+
+		; Can use this to see how much micromem is left. (The assembler warns if the code overflows.)
+		;.rept 93
+		;NOP								NOP
+		;.endr
+
+
+.EndMPG
+
+MPGEnd:
+
+
+

@@ -1,0 +1,157 @@
+**************************************************
+Level Loading Pathway for THPS3
+Updated 7/17/2001
+**************************************************
+
+=========================================================
+*** REGULAR LEVEL ***
+change_level level=Load_LevelName (script)
+-setgametype freeskate
+-request_level <...>
+	-RequestLevel <level> -- sets skate_mod->m_requested_level
+-ScriptChangeLevel()
+	-does some network stuff, or might apply to single player
+-Return to regular game flow, update function (below) does more later
+
+
+=========================================================
+*** CUSTOM PARK, PLAYED AS REGULAR ***
+change_level level=custom_park (script, launched from menu)
+-setgametype freeskate
+-request_level <...>
+	-RequestLevel <level> -- sets skate_mod->m_requested_level
+-ScriptChangeLevel()
+	-does some network stuff, or might apply to single player
+-Return to regular game flow, update function (below) does more later
+
+
+=========================================================
+*** GOING INTO PARK EDITOR ***
+AutoLaunch level=custom_park game=parkeditor
+-SetServerMode on (command)
+-request_level level=<level>
+	-RequestLevel <level> -- sets skate_mod->m_requested_level
+-SetGameType <game>
+-launchmenuscreen screen=parked_menu
+-Return to regular game flow, update function (below) does more later
+
+
+=========================================================
+*** UPDATE FUNCTION, ALL ***
+-CallMemberFunction, request==GameFlow_RequestLevel
+	-*** REGULAR LEVEL ***
+		-LoadLevel (script, see details below)
+	-*** PARK EDITOR ***
+		-DoParkGeneration (script, see below)
+
+
+=========================================================
+*** REGULAR LEVEL ***
+LoadLevel (script)
+-SetServerMode (command)
+-PreLevelLoad (script, see details below)
+-LaunchLevel (command, see details below)
+-PostLevelLoad
+-ResetCamera
+
+
+=========================================================
+*** PARK EDITOR ***
+DoParkGeneration (script)
+-PreLevelLoad (script, see details below)
+-LaunchLevel (command, see details below)
+-PostLevelLoad
+-ResetCamera
+-Do color, velocity, fogging stuff normally found in Load_LevName script
+
+
+=========================================================
+-PreLevelLoad (script)
+	-Cleanup
+	-Stopping, pausing music
+	-SetArenaSize 1
+		-call to RwResourcesSetArenaSize()
+	-Sounds
+	-SetLevelExists
+		-rwviewer::SetLevelExists()
+	-SetupBasicLights
+	-DisplayLoadingScreen
+
+
+=========================================================
+LaunchLevel (command)
+-Skate::OpenLevel() 
+	-**** REGULAR LEVEL ***
+		-runs level script, e.g. Load_Can
+			-loadlevelgeometry (command)
+				-rwviewer::RequestLoad() (see details below)
+			-loadnodearray (command)
+				-Script::RemoveOldTriggerScripts(), DeleteSpawnedScripts()
+				-Script::LoadQB()
+				-ScriptParseNodeArray()
+			-LoadTerrain (loads sounds)
+			-SetRenderModeVU
+			-Set colors, velocity, fog and other level attributes
+			-Call level startup, e.g. Can_startup
+	-*** PARK EDITOR ***
+		-ParkEditor::commandGeneratePark()
+			-ParkEditor::Initialize() [need ParkEditor::mp_compressedMap to be set up at this point]
+				-Map::InitializeWorld()
+					-World::CreateParkHeap()
+						-rwviewer::RequestLoad("sk3ed.bsp") (see details below)
+						-Create new heap for generated pieces
+					-World::PreparePieceSet()
+						-disconnect world sectors (source piece set) from just-loaded RpWorld
+						-Script::RemoveOldTriggerScripts(), DeleteSpawnedScripts()
+						-Script::LoadQB()
+						-Sk3Ed_Startup (script)
+				-Map::Initialize()
+					-Map::readMapFromBuf()
+						-Clone world sectors and link to them from the RpWorld
+				-Map::GenerateWorld()
+					-Generate super sectors
+					-Obj::Proxim_Init()
+					-Obj::Rail_Init()
+
+
+=========================================================
+// Probably safe for going into editor
+
+rwviewer::RequestLoad() 
+	-world_deinit()
+	-sky_deinit()
+	-world_init()
+		-set m_level_exists
+		-set m_dff_light_active
+		-scene_load()
+			-load bits texture dictionary
+			-Gfx::SetImageDirectoryFromFileName()
+			-Gfx::TexDictionaryLoad(), set it up
+			-RwStreamOpen(), stream in world
+			-GenerateSuperSectors()
+			-load models from DFF file, gather textures from clumps, add clumps to AssMan
+			-Pipeline::Chooser::FinishLoadingWorld()
+			-Upload texture dictionary
+		-Add cameras to world
+		-run SetupViewerLights?
+		-Mip K value stuff (NGPS)
+		-Add lights
+		-Get world sector render callback function
+		-Set up particle system
+
+
+
+
+
+=========================================================
+*** LEAVING CUSTOM PARK ***
+
+chosen_leave_server
+-ParkEditor::Cleanup()
+	-Map::Destroy()
+	-Map::DestroyWorld()
+-ScriptLeaveServer()
+	-Skate::LeaveServer()
+-SetNetworkMode
+
+

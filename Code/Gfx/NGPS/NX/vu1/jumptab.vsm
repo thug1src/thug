@@ -1,0 +1,23 @@
+
+JumpTable:
+; load at micromem address 0
+
+		; initially the branch addresses will be static
+		; but they can later be written dynamically by a vu code caching system
+		NOP								B			Init
+		NOP								NOP
+		NOP								B			ProcessPacket
+		NOP								NOP
+		NOP								B			VU1Context
+		NOP								NOP
+		NOP								B			GSContext
+		NOP								NOP
+		NOP								B			SpritesInit
+		NOP								NOP
+		NOP								B			Sprites
+		NOP								NOP
+		;NOP								B			ScreenAlignedBillboards
+		;NOP								NOP
+		;NOP								B			AxialBillboards
+		;NOP								NOP
+

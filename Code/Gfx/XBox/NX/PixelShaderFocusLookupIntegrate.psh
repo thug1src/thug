@@ -1,0 +1,22 @@
+;------------------------------------------------------------------------------
+; FocusBlur by choosing a range of z values and using that to select
+; a blurred version of the original image.
+; 
+; Copyright (C) 2001 Microsoft Corporation
+; All rights reserved.
+;------------------------------------------------------------------------------
+xps.1.1
+
+def c0, 0.5f, 0.5f, 0.5f, 0.5f		; blur value
+
+; source textures
+tex t0				; z-buffer texture
+texreg2ar t1, t0	; lookup-table texture to choose what range of depth to use
+tex t2				; pre-blurred texture, first offset
+tex t3				; pre-blurred texture, second offset
+
+; blur pre-blurred texture even more
+lrp r0, c0, t2, t3
+
+; modulate by depth range
+xfc r0_sat, 1-t1.a, zero, zero, zero, zero, 1-t1.a

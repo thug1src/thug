@@ -1,0 +1,3 @@
+xps.1.1
+mul_x2	v0.rgb,v0.rgb,c0.rgb						; Modulate vertex color0 with material color0
+mov		r0,v0

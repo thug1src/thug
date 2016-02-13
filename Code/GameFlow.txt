@@ -1,0 +1,147 @@
+Flow of control
+=====================================
+
+"autolaunch level=Load_Sch game=career"
+
+script autolaunch
+	script request_level level=<level>
+		ScriptRequestLevel
+			-set Skate::m_requested_level
+	script cleanup_before_loading_level
+		ScriptCleanup
+			-skate_mod->Cleanup( )
+			-skate_mod->GetGoalManager()->RemoveAllGoals()
+			-particle_manager->DestroyAllSystems();
+			-ParticleFX::BloodSplatDestroy();
+			-SkateScript::ClearNodeNameHashTable();
+			-ParticleFX::DestroyTerrainEffectProperties();
+			-gfx_man->DisableFog();
+			-Script::KillStoppedScripts();
+			-sk3_sfx_manager->Reset( );
+
+			-sfx_manager->CleanUp( );
+
+			-ass_manager->UnloadAllTables( );
+
+			-Script::CSymbolTableEntry *p_sym=Script::LookUpSymbol("NodeArray");
+			-if (p_sym)
+				SkateScript::UnloadQB(p_sym->mSourceFileNameChecksum);
+	
+			-SkateScript::UnloadQB(s_level_specific_qb);
+			-ScriptUnloadAllLevelGeometry(NULL,NULL);
+
+			-skate_mod->UnloadSkaters();
+			-Mem::Manager::sHandle().DeleteSkaterHeaps();
+
+	script load_requested_level level=load_sch
+		script LoadLevel
+    			script PreLevelLoad 
+				-does nothing
+    			ScriptLaunchLevel level=load_sch
+				-Skate::OpenLevel()
+					-Script::RunScript(level_script);
+						script Load_Sch
+							script load_level level_sch
+								-see below....
+    			PostLevelLoad
+				-does nothing
+	gameflow StandardGameFlow
+		skate_mod->mp_gameFlow->Reset( ScriptChecksum )
+			-set m_requestedScript
+			
+Later...
+
+CGameFlow::Update()
+	GameFlow_Startup
+		-reset panel, sound stuff
+		-maybe enter free skate in network game
+		-choose game mode
+		-Put skaters in world
+		-Set screen mode
+		-Run intro script
+	-repeat:
+		GameFlow_StartRun
+		GameFlow_PlayRun
+		GameFlow_WaitEnd
+		-and other shit
+
+=====================================
+
+-----------------------
+"load_level level_sch"
+
+Level_Sch = {
+    loading_screen  =   "loadscrn_generic"
+    pre             =   "sch.pre"
+    scnpre          =   "schscn.pre"
+    Level           =   "sch"
+    Sky             =   "sf2_Sky"
+    qb              =   "levels\sch\sch.qb"
+    colpre          =   "schcol.pre"
+    level_qb        =   "levels\sch\sch_scripts.qb"
+    startup_script  =   sch_Startup
+    default_stats   =   5
+}
+
+Level_Sk4Ed = {
+    loading_screen  =   "loadscrn_generic"
+    pre             =   "sk4ed.pre"
+    scnpre          =   "sk4edscn.pre"
+    Level           =   "sk4ed"
+    Sky             =   "can_Sky"
+    qb              =   "levels\sk4ed\sk4ed.qb"
+    colpre          =   "sk4edcol.pre"
+    level_qb        =   "levels\sk4ed\sk4ed_scripts.qb"
+    startup_script  =   Sk4Ed_Startup
+    default_stats   =   8
+    level_number    =   LevelNum_Lon
+    park_editor
+}
+-----------------------
+
+
+script load_level level_sch	
+	DisplayLoadingScreen <loading_screen>
+	
+	*** Park editor yes ***
+	script LoadLevelPreFile	<scnpre>
+		ScriptLoadPreFile
+	*** Park editor, need special flag ***
+	ScriptLoadScene scene=<level> (for sky, then world)
+		Nx::CTexDictManager::sLoadTextureDictionary(p_scene_name)
+		Nx::CEngine::sLoadScene(p_scene_name, p_tex_dict);
+	ScriptUnloadPreFile
+	
+	*** Park editor maybe ***
+	script LoadLevelPreFile <colpre>
+	ScriptLoadCollision scene=<level>
+		p_scene->LoadCollision(p_scene_name)
+	ScriptUnloadPreFile
+	
+	*** Park editor yes ***
+	script LoadLevelPreFile <pre>
+	ScriptLoadQB <level_qb>
+		SkateScript::LoadQB
+			Script::LoadQB
+				-load it into memory
+				ParseQB()
+				-restart all scripts referring to symbols
+			-do symbol table processing
+				-do following just for NodeArray symbol
+				- can reference nodes by name or prefix
+				CreateNodeNameHashTab
+				GeneratePrefixInfo();
+	*** don't call ScriptParseNodeArray for park editor, I don't think ***
+	*** duplicate some functionality ***
+	ScriptLoadNodeArray <qb>
+		SkateScript::LoadQB (see above)
+		ScriptParseNodeArray
+			-does a lot of stuff...
+	LoadTerrain
+		-doesn't seem to exist
+	CC_Startup
+		-loads some test camera stuff
+	run <startup_script> (sch_startup)       
+	ScriptUnloadPreFile
+
+

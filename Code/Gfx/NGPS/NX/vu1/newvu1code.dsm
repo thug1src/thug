@@ -1,0 +1,27 @@
+
+.global NewMPGStart
+.global NewMPGEnd
+
+.include "defs.vsm"
+
+; align to a 2^7=128 byte boundary for faster dma transfer
+.align	7
+
+NewMPGStart:
+
+.DmaData ParticleVU1CodeStart
+
+	MPG 0, *
+	
+		.include "jumptab.vsm"
+		.include "main.vsm"
+		.include "particle.vsm"
+		;.include "billboard.vsm"
+
+	.EndMPG
+	
+.EndDmaData
+NewMPGEnd:
+
+; force rebuild
+
